@@ -1,0 +1,14 @@
+services:
+  doorbell-api:
+    image: node:20-alpine
+    container_name: doorbell-api
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      - API_KEY=${API_KEY:-RAHASIA_BEL_RUMAH_123}
+      - PORT=3000
+    command: sh -c "npm install express && node main.js"
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
