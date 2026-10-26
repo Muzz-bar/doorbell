@@ -7,6 +7,14 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.set('trust proxy', true);
 
+// Anti-Cache agar dashboard dan status API selalu real-time tanpa tertahan browser / Cloudflare
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
+
 const PORT = Number(process.env.PORT) || 3000;
 const API_KEY = process.env.API_KEY || 'PrikitiwMauNgapainNjirrrL@hhh';
 
@@ -24,14 +32,22 @@ const MELODIES_FILE = path.join(DATA_DIR, 'melodies.json');
 
 // Database Melodi (52 Lagu dari folder sound/buzzer/src)
 let allMelodies = [];
-try {
-  if (fs.existsSync(MELODIES_FILE)) {
-    allMelodies = JSON.parse(fs.readFileSync(MELODIES_FILE, 'utf8'));
-    console.log(`🎵 Database melodi berhasil dimuat: ${allMelodies.length} lagu tersedia.`);
+
+function ensureMelodiesLoaded() {
+  if (allMelodies.length === 0) {
+    try {
+      if (fs.existsSync(MELODIES_FILE)) {
+        allMelodies = JSON.parse(fs.readFileSync(MELODIES_FILE, 'utf8'));
+        console.log(`🎵 Database melodi berhasil dimuat: ${allMelodies.length} lagu tersedia.`);
+      }
+    } catch (e) {
+      console.error('⚠️ Gagal memuat database melodies.json:', e.message);
+    }
   }
-} catch (e) {
-  console.error('⚠️ Gagal memuat database melodies.json:', e.message);
+  return allMelodies;
 }
+
+ensureMelodiesLoaded();
 
 // State Bel & Konfigurasi Default (Akan ditimpa oleh pengaturan terakhir di state.json)
 let isRinging = false;
@@ -202,7 +218,7 @@ loadState();
 // ========== MIDDLEWARE AUTH (API) ==========
 
 const auth = (req, res, next) => {
-  const requestKey = req.headers['x-api-key'];
+  const requestKey = (req.headers['x-api-key'] || req.query.key || '').trim();
   if (requestKey !== API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -382,6 +398,7 @@ app.get('/status', auth, (req, res) => {
     pendingRings = 0;
   }
 
+  ensureMelodiesLoaded();
   // Cari lagu aktif dari database 52 lagu
   const activeMelody = allMelodies.find(m => m.id === activeMelodyId) || allMelodies[0] || {
     id: 'mario_bros',
@@ -416,14 +433,19 @@ app.post('/reset', auth, (req, res) => {
 
 // API Update Pengaturan (Mute, Nada, Lagu Melodi Jukebox, Buzzer Type, & Anti-Spam) dari Web
 app.post('/api/settings', auth, (req, res) => {
+  ensureMelodiesLoaded();
+
   if (typeof req.body.muted === 'boolean') {
     isMuted = req.body.muted;
   }
   if (req.body.tone && [1, 2, 3, 4, 5].includes(Number(req.body.tone))) {
     activeTone = Number(req.body.tone);
   }
-  if (typeof req.body.melody_id === 'string' && allMelodies.some(m => m.id === req.body.melody_id)) {
-    activeMelodyId = req.body.melody_id;
+  if (typeof req.body.melody_id === 'string' && req.body.melody_id.trim()) {
+    const targetId = req.body.melody_id.trim();
+    if (allMelodies.length === 0 || allMelodies.some(m => m.id === targetId)) {
+      activeMelodyId = targetId;
+    }
   }
   if (req.body.buzzer_type === 'passive' || req.body.buzzer_type === 'active') {
     buzzerType = req.body.buzzer_type;
@@ -466,6 +488,7 @@ app.post('/api/settings', auth, (req, res) => {
 
 // Endpoint Daftar 52 Lagu Jukebox
 app.get('/api/melodies', auth, (req, res) => {
+  ensureMelodiesLoaded();
   return res.json({
     active_melody: activeMelodyId,
     buzzer_type: buzzerType,
@@ -476,6 +499,7 @@ app.get('/api/melodies', auth, (req, res) => {
 
 // API Riwayat & Pengaturan untuk Dashboard Web
 app.get('/api/history', auth, (req, res) => {
+  ensureMelodiesLoaded();
   const currentMelodyName = (allMelodies.find(m => m.id === activeMelodyId) || {}).name || activeMelodyId;
   return res.json({
     total: totalCounter,
@@ -1354,6 +1378,26 @@ app.get('/dashboard', (req, res) => {
       }
     }
 
+    /* Notifikasi Toast */
+    function showToast(msg, isSuccess = true) {
+      let toast = document.getElementById('toastNotice');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'toastNotice';
+        toast.style.cssText = 'position:fixed; bottom:20px; right:20px; z-index:9999; padding:10px 16px; border-radius:8px; font-size:12px; font-weight:600; box-shadow:0 8px 20px rgba(0,0,0,0.4); transition:all 0.25s ease; opacity:0; transform:translateY(8px); pointer-events:none;';
+        document.body.appendChild(toast);
+      }
+      toast.textContent = msg;
+      toast.style.background = isSuccess ? '#10b981' : '#ef4444';
+      toast.style.color = '#ffffff';
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateY(0)';
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(8px)';
+      }, 2000);
+    }
+
     /* Audio Preview Web Audio API */
     function stopAudio() {
       activeAudioTimers.forEach(t => clearTimeout(t));
@@ -1366,36 +1410,48 @@ app.get('/dashboard', (req, res) => {
 
     function playMelodyPreview(notes) {
       stopAudio();
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === 'suspended') audioCtx.resume();
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
 
-      let t = audioCtx.currentTime + 0.05;
-      notes.forEach(([freq, durMs]) => {
-        const durSec = durMs / 1000;
-        if (freq > 0) {
-          const osc = audioCtx.createOscillator();
-          const gain = audioCtx.createGain();
-          osc.type = 'square';
-          osc.frequency.setValueAtTime(freq, t);
-          gain.gain.setValueAtTime(0.10, t);
-          gain.gain.setValueAtTime(0.10, t + durSec * 0.85);
-          gain.gain.linearRampToValueAtTime(0.001, t + durSec);
+        let t = audioCtx.currentTime + 0.05;
+        notes.forEach(([freq, durMs]) => {
+          const durSec = durMs / 1000;
+          if (freq > 0) {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(freq, t);
+            gain.gain.setValueAtTime(0.08, t);
+            gain.gain.setValueAtTime(0.08, t + durSec * 0.85);
+            gain.gain.linearRampToValueAtTime(0.001, t + durSec);
 
-          osc.connect(gain);
-          gain.connect(audioCtx.destination);
-          osc.start(t);
-          osc.stop(t + durSec);
-        }
-        t += durSec * 1.30;
-      });
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start(t);
+            osc.stop(t + durSec);
+          }
+          t += durSec * 1.30;
+        });
 
-      const totalMs = (t - audioCtx.currentTime) * 1000 + 150;
-      activeAudioTimers.push(setTimeout(() => { stopAudio(); }, totalMs));
+        const totalMs = (t - audioCtx.currentTime) * 1000 + 150;
+        activeAudioTimers.push(setTimeout(() => { stopAudio(); }, totalMs));
+      } catch (err) {
+        console.error('AudioContext error:', err);
+      }
+    }
+
+    function playMelodyById(id, ev) {
+      if (ev) ev.stopPropagation();
+      const m = allMelodies.find(x => x.id === id);
+      if (m && m.notes) {
+        showToast('▶ Memutar preview: ' + m.name);
+        playMelodyPreview(m.notes);
+      }
     }
 
     function previewCurrentActiveMelody() {
-      const m = allMelodies.find(x => x.id === currentActiveMelodyId);
-      if (m && m.notes) playMelodyPreview(m.notes);
+      playMelodyById(currentActiveMelodyId);
     }
 
     async function loadMelodiesCatalog() {
@@ -1445,7 +1501,9 @@ app.get('/dashboard', (req, res) => {
       });
 
       if (filtered.length === 0) {
-        container.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 20px; color: #64748b; font-size:12px;">Tidak ada melodi yang sesuai</div>';
+        container.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 24px; color: #64748b; font-size:12px;">' +
+          (allMelodies.length === 0 ? 'Memuat database lagu...' : 'Tidak ada melodi yang sesuai') +
+          '</div>';
         return;
       }
 
@@ -1454,9 +1512,8 @@ app.get('/dashboard', (req, res) => {
       container.innerHTML = filtered.map(m => {
         const isActive = (m.id === currentActiveMelodyId);
         const cat = catBadges[m.category] || m.category;
-        const notesStr = JSON.stringify(m.notes);
 
-        return '<div class="song-card ' + (isActive ? 'active-song' : '') + '">' +
+        return '<div class="song-card ' + (isActive ? 'active-song' : '') + '" onclick="applyMelody(\'' + m.id + '\')" style="cursor:pointer;">' +
           '<div>' +
             '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
               '<span style="font-size:10px; background:#1e293b; color:#94a3b8; padding:1px 6px; border-radius:4px; font-weight:600;">' + cat + '</span>' +
@@ -1466,8 +1523,8 @@ app.get('/dashboard', (req, res) => {
             '<div class="song-info-meta">' + m.noteCount + ' ketukan nada</div>' +
           '</div>' +
           '<div class="song-actions">' +
-            '<button class="btn-sm btn-preview" onclick=\'playMelodyPreview(' + notesStr + ')\'>▶ Dengar</button>' +
-            (!isActive ? '<button class="btn-sm btn-apply" onclick="applyMelody(\'' + m.id + '\')">Pasang</button>' : '') +
+            '<button type="button" class="btn-sm btn-preview" onclick="playMelodyById(\'' + m.id + '\', event)">▶ Dengar</button>' +
+            (!isActive ? '<button type="button" class="btn-sm btn-apply" onclick="applyMelody(\'' + m.id + '\')">Pasang</button>' : '') +
           '</div>' +
         '</div>';
       }).join('');
@@ -1480,13 +1537,16 @@ app.get('/dashboard', (req, res) => {
       renderMelodyCards();
 
       try {
-        await fetch('/api/settings', {
+        const res = await fetch('/api/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
-          body: JSON.stringify({ melody_id: melodyId, buzzer_type: currentBuzzerType })
+          body: JSON.stringify({ melody_id: melodyId })
         });
+        if (res.ok) {
+          showToast('✅ Melodi bel diubah: ' + (m ? m.name : melodyId));
+        }
       } catch (e) {
-        alert('Gagal memasang lagu!');
+        showToast('❌ Gagal memasang lagu!', false);
       }
     }
 
@@ -1494,13 +1554,16 @@ app.get('/dashboard', (req, res) => {
       currentBuzzerType = type;
       updateBuzzerTypeUI(type);
       try {
-        await fetch('/api/settings', {
+        const res = await fetch('/api/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
-          body: JSON.stringify({ buzzer_type: type, melody_id: currentActiveMelodyId })
+          body: JSON.stringify({ buzzer_type: type })
         });
+        if (res.ok) {
+          showToast(type === 'passive' ? '🔊 Mode: Passive Buzzer (3-Pin PWM)' : '🔉 Mode: Active Buzzer (2-Pin Beep)');
+        }
       } catch (e) {
-        console.error('Gagal update buzzer type');
+        console.error('Gagal update buzzer type', e);
       }
     }
 
