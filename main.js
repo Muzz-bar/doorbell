@@ -15,8 +15,8 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT = Number(process.env.PORT) || 3000;
-const API_KEY = process.env.API_KEY || 'PrikitiwMauNgapainNjirrrL@hhh';
+const PORT = Number(process.env.PORT);
+const API_KEY = process.env.API_KEY ;
 
 // Konfigurasi Opsional Webhook (Telegram / Discord)
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -68,6 +68,7 @@ const MAX_HISTORY = 200;
 let lastClickSerial = null;
 let lastClickTimestamp = 0;
 let activeReceivers = {}; // id -> { name, lastSeen, ip }
+let transmitterBattery = null; // { mv: 4120, pct: 92, voltage: '4.12', lastUpdated: Date.now() }
 
 // Aturan Anti-Spam Cerdas (Dapat Diubah Dinamis dari Web Dashboard & Tersimpan Permanen):
 let spamGapThresholdMs = 3000;   // Jeda 3 detik untuk mendeteksi spam
@@ -118,6 +119,7 @@ function loadState() {
       if (typeof rawData.totalCounter === 'number') totalCounter = rawData.totalCounter;
       if (typeof rawData.ringSequence === 'number') ringSequence = rawData.ringSequence;
       if (Array.isArray(rawData.ringHistory)) ringHistory = rawData.ringHistory;
+      if (rawData.transmitterBattery) transmitterBattery = rawData.transmitterBattery;
 
       // Pengaturan anti-spam dinamis yang disimpan pengguna:
       if (rawData.spamGapThresholdMs !== undefined) spamGapThresholdMs = Math.max(500, Number(rawData.spamGapThresholdMs) || 3000);
@@ -157,6 +159,7 @@ function saveState() {
       spamGapThresholdMs,
       spamMaxStrikes,
       spamHoldDurationMs,
+      transmitterBattery,
       lastSaved: new Date().toISOString()
     };
 
@@ -195,7 +198,16 @@ async function sendPushNotification(entry) {
     ? (entry.muted ? '🔇 Muted (Lampu Saja)' : '🔊 Buzzer Berbunyi')
     : '🚫 Ditahan (Proteksi Spam)';
 
-  const msg = `🔔 *BEL PINTU DITEKAN!*\n• *Sumber:* ${entry.source}\n• *Status:* ${statusStr}\n• *Urutan:* #${entry.consecutive} (${entry.allowed ? 'Diizinkan' : 'Ditahan'})\n• *Waktu:* ${entry.time_local}`;
+  let batInfo = '';
+  if (transmitterBattery && transmitterBattery.pct !== null) {
+    const icon = transmitterBattery.pct > 50 ? '🔋' : (transmitterBattery.pct > 20 ? '🪫' : '⚠️');
+    batInfo = `\n• *Baterai 18650:* ${icon} ${transmitterBattery.pct}% (${transmitterBattery.voltage}V)`;
+    if (transmitterBattery.pct < 20) {
+      batInfo += ` _(Harap Segera Dicas!)_`;
+    }
+  }
+
+  const msg = `🔔 *BEL PINTU DITEKAN!*\n• *Sumber:* ${entry.source}\n• *Status:* ${statusStr}\n• *Urutan:* #${entry.consecutive} (${entry.allowed ? 'Diizinkan' : 'Ditahan'})${batInfo}\n• *Waktu:* ${entry.time_local}`;
 
   if (TG_TOKEN && TG_CHAT_ID) {
     fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
@@ -243,6 +255,18 @@ app.post('/ring', auth, (req, res) => {
   if (receiverId && clickSerial !== null) {
     const rName = receiverId === 'Receiver_A' ? 'Rumah A' : (receiverId === 'Receiver_B' ? 'Rumah B' : receiverId);
     source = `Tombol Pager (${rName})`;
+  }
+
+  // Update data baterai transmitter jika dikirimkan oleh receiver
+  const vbatMv = Number(req.body?.vbat_mv) || null;
+  const batteryPct = (req.body?.battery_pct !== undefined && req.body?.battery_pct !== null && Number(req.body.battery_pct) <= 100) ? Number(req.body.battery_pct) : null;
+  if (vbatMv && batteryPct !== null) {
+    transmitterBattery = {
+      mv: vbatMv,
+      pct: batteryPct,
+      voltage: (vbatMv / 1000).toFixed(2),
+      lastUpdated: now
+    };
   }
 
   // Update telemetry receiver yang melapor
@@ -594,6 +618,7 @@ app.get('/api/history', auth, (req, res) => {
     maxStrikes: spamMaxStrikes,
     holdDurationSec: spamHoldDurationMs / 1000,
     receivers: activeReceivers,
+    battery: transmitterBattery,
     lastClickSerial: lastClickSerial,
     history: ringHistory,
   });
@@ -1221,12 +1246,13 @@ app.get('/dashboard', (req, res) => {
         </div>
 
         <!-- Transmitter -->
-        <div class="device-item">
+        <div class="device-item" id="cardTransmitter">
           <div class="device-header">
             <span class="device-name">Transmitter Pager</span>
             <span class="badge-status badge-online">ESP-NOW</span>
           </div>
           <div id="infoTransmitter" class="device-meta">Deep Sleep (~5µA) • LED off</div>
+          <div id="batteryTransmitter" class="device-meta" style="margin-top:3px; color:#10b981; font-weight:600;">🔋 Baterai: Standby (~5µA)</div>
         </div>
       </div>
     </section>
@@ -1359,6 +1385,7 @@ app.get('/dashboard', (req, res) => {
             <tr>
               <th>#</th>
               <th>Sumber</th>
+              <th>Unit Berbunyi</th>
               <th>Status</th>
               <th>Serial</th>
               <th>Waktu</th>
@@ -1759,7 +1786,7 @@ app.get('/dashboard', (req, res) => {
       }
     }
 
-    function updateHardwareUI(receivers, lastClickSerial) {
+    function updateHardwareUI(receivers, lastClickSerial, battery) {
       const now = Date.now();
 
       function updateDevice(cardId, badgeId, infoId, ringId, data, label) {
@@ -1811,10 +1838,22 @@ app.get('/dashboard', (req, res) => {
       updateDevice('cardReceiverB', 'badgeReceiverB', 'infoReceiverB', 'ringReceiverB', receivers ? receivers['Receiver_B'] : null, 'Rumah B');
 
       const infoTx = document.getElementById('infoTransmitter');
+      const batTx = document.getElementById('batteryTransmitter');
       if (infoTx) {
         infoTx.textContent = (lastClickSerial !== null && lastClickSerial !== undefined)
           ? 'Deep Sleep siaga • Seri #' + lastClickSerial + ' (ESP-NOW 2.4GHz)'
           : 'Deep Sleep siaga (~5µA) • LED off';
+      }
+      if (batTx) {
+        if (battery && battery.pct !== null && battery.pct !== undefined) {
+          const pct = battery.pct;
+          const volt = battery.voltage || (battery.mv / 1000).toFixed(2);
+          const col = pct > 50 ? '#10b981' : (pct > 20 ? '#f59e0b' : '#ef4444');
+          const icon = pct > 50 ? '🔋' : (pct > 20 ? '🪫' : '⚠️');
+          batTx.innerHTML = '<span style="color:' + col + '; font-weight:700;">' + icon + ' ' + pct + '% (' + volt + 'V) • 18650</span>';
+        } else {
+          batTx.innerHTML = '<span style="color:#64748b;">🔋 Baterai: Standby (Pasang 2x R 100kΩ untuk monitor %)</span>';
+        }
       }
     }
 
@@ -1882,7 +1921,7 @@ app.get('/dashboard', (req, res) => {
           if (alertBox) alertBox.style.display = 'none';
         }
 
-        updateHardwareUI(data.receivers, data.lastClickSerial);
+        updateHardwareUI(data.receivers, data.lastClickSerial, data.battery);
 
         const tbody = document.getElementById('logBody');
         const emptyState = document.getElementById('emptyState');
@@ -1914,18 +1953,20 @@ app.get('/dashboard', (req, res) => {
               rPills = entry.receivers_ack.map(function(r) {
                 const isEsp = (r.method === 'ESP-NOW');
                 const icon = isEsp ? '⚡' : '🌐';
-                const bg = isEsp ? 'rgba(59, 130, 246, 0.18)' : 'rgba(16, 185, 129, 0.18)';
+                const bg = isEsp ? 'rgba(59, 130, 246, 0.2)' : 'rgba(16, 185, 129, 0.2)';
+                const border = isEsp ? 'rgba(59, 130, 246, 0.4)' : 'rgba(16, 185, 129, 0.4)';
                 const col = isEsp ? '#60a5fa' : '#34d399';
-                return '<span style="display:inline-block; font-size:10px; padding:1px 6px; border-radius:4px; background:' + bg + '; color:' + col + '; font-weight:600; margin-right:4px; margin-top:3px;">' +
+                return '<span style="display:inline-flex; align-items:center; gap:3px; font-size:11px; padding:2px 7px; border-radius:5px; background:' + bg + '; border:1px solid ' + border + '; color:' + col + '; font-weight:700; margin-right:4px;">' +
                   r.name + ' ' + icon + '</span>';
               }).join('');
             } else {
-              rPills = '<span style="font-size:10px; color:#64748b;">Standby ACK</span>';
+              rPills = '<span style="font-size:11px; color:#64748b; font-style:italic;">Menunggu ACK...</span>';
             }
 
             return '<tr>' +
               '<td style="color:#64748b; font-family:monospace;">#' + entry.id + '</td>' +
-              '<td><div><span class="badge-src ' + srcClass + '">' + srcLabel + '</span></div><div style="margin-top:2px;">' + rPills + '</div></td>' +
+              '<td><span class="badge-src ' + srcClass + '">' + srcLabel + '</span></td>' +
+              '<td>' + rPills + '</td>' +
               '<td><span style="color:' + statusColor + '; font-weight:700;">' + statusText + '</span></td>' +
               '<td style="font-family:monospace; color:#94a3b8;">' + (entry.serial !== '-' ? '#' + entry.serial : '-') + '</td>' +
               '<td style="font-family:monospace; color:#f8fafc;">' + time + '</td>' +
