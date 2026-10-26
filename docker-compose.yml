@@ -5,9 +5,11 @@ services:
     working_dir: /app
     volumes:
       - ./:/app
+    env_file:
+      - .env
     environment:
-      - API_KEY=${API_KEY:-RAHASIA_BEL_RUMAH_123}
-      - PORT=3000
+      API_KEY: ${API_KEY}
+      PORT: 3000
     command: sh -c "npm install express && node main.js"
     ports:
       - "3010:3000"

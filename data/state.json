@@ -1,0 +1,7 @@
+{
+  "isMuted": false,
+  "activeTone": 1,
+  "spamGapThresholdMs": 3000,
+  "spamMaxStrikes": 5,
+  "spamHoldDurationMs": 15000
+}

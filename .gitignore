@@ -1,3 +1,20 @@
 .env
 .env.*
 !.env.example
+
+# ESP Source Code
+esp32c3_transmitter/
+esp32c3_receiver/
+*.ino
+*.bin
+*.elf
+
+# Arduino / Build Artifacts
+.vscode/
+build/
+.pio/
+
+# Node
+node_modules/
+npm-debug.log
+/esp32c3_receiver
