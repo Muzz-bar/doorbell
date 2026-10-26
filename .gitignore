@@ -14,7 +14,14 @@ esp32c3_receiver/
 build/
 .pio/
 
+# Sound repo raw cache (melodies already compiled in data/melodies.json)
+sound/
+
+# Runtime state & history (agar git pull di server VPS tidak bentrok)
+data/state.json
+data/*.tmp
+data/*.bak
+
 # Node
 node_modules/
 npm-debug.log
-/esp32c3_receiver
