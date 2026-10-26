@@ -10,5 +10,5 @@ services:
       - PORT=3000
     command: sh -c "npm install express && node main.js"
     ports:
-      - "3000:3000"
+      - "3010:3000"
     restart: unless-stopped
