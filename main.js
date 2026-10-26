@@ -486,15 +486,29 @@ app.post('/api/settings', auth, (req, res) => {
   });
 });
 
-// Endpoint Daftar 52 Lagu Jukebox
+// Endpoint Daftar 52 Lagu Jukebox (Ringan tanpa dump notes besar agar load instan <100ms)
 app.get('/api/melodies', auth, (req, res) => {
   ensureMelodiesLoaded();
+  const summary = allMelodies.map(m => ({
+    id: m.id,
+    name: m.name,
+    category: m.category,
+    noteCount: m.noteCount
+  }));
   return res.json({
     active_melody: activeMelodyId,
     buzzer_type: buzzerType,
     total: allMelodies.length,
-    melodies: allMelodies
+    melodies: summary
   });
+});
+
+// Endpoint Nada untuk Preview Lagu Spesifik (Dipanggil hanya saat tombol Dengar ditekan)
+app.get('/api/melody/:id', auth, (req, res) => {
+  ensureMelodiesLoaded();
+  const m = allMelodies.find(x => x.id === req.params.id);
+  if (!m) return res.status(404).json({ error: 'Melody not found' });
+  return res.json({ id: m.id, name: m.name, notes: m.notes });
 });
 
 // API Riwayat & Pengaturan untuk Dashboard Web
@@ -1294,20 +1308,71 @@ app.get('/dashboard', (req, res) => {
   </main>
 
   <script>
-    const API_KEY = sessionStorage.getItem('doorbell_key');
-    if (!API_KEY) window.location.href = '/';
+    // Storage Fallback (sessionStorage + localStorage + URL param)
+    function getStoredApiKey() {
+      try {
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('key')) return urlParams.get('key');
+      } catch(_) {}
+      try {
+        if (window.sessionStorage && sessionStorage.getItem('doorbell_key')) {
+          return sessionStorage.getItem('doorbell_key');
+        }
+      } catch(_) {}
+      try {
+        if (window.localStorage && localStorage.getItem('doorbell_key')) {
+          return localStorage.getItem('doorbell_key');
+        }
+      } catch(_) {}
+      return '';
+    }
+
+    const API_KEY = getStoredApiKey();
+    if (!API_KEY) {
+      window.location.href = '/';
+    } else {
+      try {
+        sessionStorage.setItem('doorbell_key', API_KEY);
+        localStorage.setItem('doorbell_key', API_KEY);
+      } catch(_) {}
+    }
 
     let lastKnownCount = 0;
     let allMelodies = [];
+    let notesCache = {}; // Cache nada lagu yang sudah di-fetch agar preview instan
     let currentActiveMelodyId = 'mario_bros';
     let currentBuzzerType = 'passive';
     let selectedCategory = 'all';
     let audioCtx = null;
     let activeAudioTimers = [];
+    let lastSettingChangeTime = 0; // Kunci anti-race-condition agar polling tidak membalikkan pilihan user
 
     function logout() {
-      sessionStorage.removeItem('doorbell_key');
+      try {
+        sessionStorage.removeItem('doorbell_key');
+        localStorage.removeItem('doorbell_key');
+      } catch(_) {}
       window.location.href = '/';
+    }
+
+    /* Notifikasi Toast */
+    function showToast(msg, isSuccess = true) {
+      let toast = document.getElementById('toastNotice');
+      if (!toast) {
+        toast = document.createElement('div');
+        toast.id = 'toastNotice';
+        toast.style.cssText = 'position:fixed; bottom:20px; right:20px; z-index:9999; padding:11px 18px; border-radius:8px; font-size:13px; font-weight:600; box-shadow:0 8px 24px rgba(0,0,0,0.5); transition:all 0.25s ease; opacity:0; transform:translateY(8px); pointer-events:none;';
+        document.body.appendChild(toast);
+      }
+      toast.textContent = msg;
+      toast.style.background = isSuccess ? '#10b981' : '#ef4444';
+      toast.style.color = '#ffffff';
+      toast.style.opacity = '1';
+      toast.style.transform = 'translateY(0)';
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(8px)';
+      }, 2400);
     }
 
     async function triggerWebRing() {
@@ -1321,9 +1386,14 @@ app.get('/dashboard', (req, res) => {
           headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
           body: JSON.stringify({ source: 'Web' })
         });
-        if (res.ok) fetchHistory();
+        if (res.ok) {
+          showToast('🔔 Bel pintu berhasil dibunyikan!');
+          fetchHistory();
+        } else {
+          showToast('❌ Gagal membunyikan bel (' + res.status + ')', false);
+        }
       } catch (err) {
-        alert('Gagal membunyikan bel!');
+        showToast('❌ Gagal terhubung ke server', false);
       } finally {
         setTimeout(() => {
           btn.disabled = false;
@@ -1333,27 +1403,34 @@ app.get('/dashboard', (req, res) => {
     }
 
     async function toggleMute(isMuted) {
+      lastSettingChangeTime = Date.now();
       updateMuteUI(isMuted);
       try {
-        await fetch('/api/settings', {
+        const res = await fetch('/api/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
           body: JSON.stringify({ muted: isMuted })
         });
+        if (res.ok) {
+          showToast(isMuted ? '🔇 Mode Senyap Aktif' : '🔊 Suara Bel Diaktifkan');
+        }
       } catch (err) {
-        console.error('Gagal update mute');
+        showToast('❌ Gagal update status mute', false);
       }
     }
 
     function updateMuteUI(isMuted) {
-      document.getElementById('muteToggle').checked = isMuted;
+      const toggle = document.getElementById('muteToggle');
+      if (toggle) toggle.checked = isMuted;
       const label = document.getElementById('muteLabel');
-      if (isMuted) {
-        label.textContent = 'Buzzer Dibungkam';
-        label.style.color = '#ef4444';
-      } else {
-        label.textContent = 'Suara Aktif';
-        label.style.color = '#e2e8f0';
+      if (label) {
+        if (isMuted) {
+          label.textContent = 'Buzzer Dibungkam';
+          label.style.color = '#ef4444';
+        } else {
+          label.textContent = 'Suara Aktif';
+          label.style.color = '#e2e8f0';
+        }
       }
     }
 
@@ -1369,33 +1446,18 @@ app.get('/dashboard', (req, res) => {
           body: JSON.stringify({ spamGapSec, maxStrikes, holdDurationSec })
         });
         if (res.ok) {
+          showToast('✅ Pengaturan Anti-Spam tersimpan!');
           const msg = document.getElementById('saveSettingsMsg');
-          msg.style.display = 'block';
-          setTimeout(() => { msg.style.display = 'none'; }, 2500);
+          if (msg) {
+            msg.style.display = 'block';
+            setTimeout(() => { msg.style.display = 'none'; }, 2500);
+          }
+        } else {
+          showToast('❌ Gagal menyimpan Anti-Spam', false);
         }
       } catch (err) {
-        alert('Gagal menyimpan aturan anti-spam!');
+        showToast('❌ Gagal menyimpan aturan anti-spam!', false);
       }
-    }
-
-    /* Notifikasi Toast */
-    function showToast(msg, isSuccess = true) {
-      let toast = document.getElementById('toastNotice');
-      if (!toast) {
-        toast = document.createElement('div');
-        toast.id = 'toastNotice';
-        toast.style.cssText = 'position:fixed; bottom:20px; right:20px; z-index:9999; padding:10px 16px; border-radius:8px; font-size:12px; font-weight:600; box-shadow:0 8px 20px rgba(0,0,0,0.4); transition:all 0.25s ease; opacity:0; transform:translateY(8px); pointer-events:none;';
-        document.body.appendChild(toast);
-      }
-      toast.textContent = msg;
-      toast.style.background = isSuccess ? '#10b981' : '#ef4444';
-      toast.style.color = '#ffffff';
-      toast.style.opacity = '1';
-      toast.style.transform = 'translateY(0)';
-      setTimeout(() => {
-        toast.style.opacity = '0';
-        toast.style.transform = 'translateY(8px)';
-      }, 2000);
     }
 
     /* Audio Preview Web Audio API */
@@ -1441,12 +1503,31 @@ app.get('/dashboard', (req, res) => {
       }
     }
 
-    function playMelodyById(id, ev) {
+    async function playMelodyById(id, ev) {
       if (ev) ev.stopPropagation();
       const m = allMelodies.find(x => x.id === id);
-      if (m && m.notes) {
-        showToast('▶ Memutar preview: ' + m.name);
-        playMelodyPreview(m.notes);
+      showToast('▶ Memuat suara: ' + (m ? m.name : id));
+
+      if (notesCache[id]) {
+        playMelodyPreview(notesCache[id]);
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/melody/' + encodeURIComponent(id), {
+          headers: { 'x-api-key': API_KEY }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.notes) {
+            notesCache[id] = data.notes;
+            playMelodyPreview(data.notes);
+          }
+        } else {
+          showToast('❌ Gagal memuat audio lagu', false);
+        }
+      } catch(e) {
+        showToast('❌ Audio error', false);
       }
     }
 
@@ -1455,19 +1536,29 @@ app.get('/dashboard', (req, res) => {
     }
 
     async function loadMelodiesCatalog() {
+      const container = document.getElementById('songGridContainer');
+      if (container && allMelodies.length === 0) {
+        container.innerHTML = '<div style="grid-column:1/-1; text-align:center; padding:24px; color:#64748b; font-size:12px;">⏳ Mengambil katalog 52 lagu...</div>';
+      }
+
       try {
         const res = await fetch('/api/melodies', { headers: { 'x-api-key': API_KEY } });
         if (res.ok) {
           const data = await res.json();
           allMelodies = data.melodies || [];
-          if (data.active_melody) currentActiveMelodyId = data.active_melody;
-          if (data.buzzer_type) {
+          if (data.active_melody && Date.now() - lastSettingChangeTime > 5000) {
+            currentActiveMelodyId = data.active_melody;
+          }
+          if (data.buzzer_type && Date.now() - lastSettingChangeTime > 5000) {
             currentBuzzerType = data.buzzer_type;
             updateBuzzerTypeUI(data.buzzer_type);
           }
           const m = allMelodies.find(x => x.id === currentActiveMelodyId);
-          if (m) document.getElementById('activeMelodyTitle').textContent = m.name;
+          const titleEl = document.getElementById('activeMelodyTitle');
+          if (titleEl) titleEl.textContent = m ? m.name : currentActiveMelodyId;
           renderMelodyCards();
+        } else if (res.status === 401) {
+          logout();
         }
       } catch (e) {
         console.error('Gagal load melodies catalog:', e);
@@ -1502,7 +1593,7 @@ app.get('/dashboard', (req, res) => {
 
       if (filtered.length === 0) {
         container.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 24px; color: #64748b; font-size:12px;">' +
-          (allMelodies.length === 0 ? 'Memuat database lagu...' : 'Tidak ada melodi yang sesuai') +
+          (allMelodies.length === 0 ? '⏳ Memuat database lagu...' : 'Tidak ada melodi yang sesuai filter') +
           '</div>';
         return;
       }
@@ -1513,7 +1604,7 @@ app.get('/dashboard', (req, res) => {
         const isActive = (m.id === currentActiveMelodyId);
         const cat = catBadges[m.category] || m.category;
 
-        return '<div class="song-card ' + (isActive ? 'active-song' : '') + '" onclick="applyMelody(\'' + m.id + '\')" style="cursor:pointer;">' +
+        return '<div class="song-card ' + (isActive ? 'active-song' : '') + '" onclick="applyMelody(\'' + m.id + '\')" style="cursor:pointer; touch-action:manipulation;">' +
           '<div>' +
             '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
               '<span style="font-size:10px; background:#1e293b; color:#94a3b8; padding:1px 6px; border-radius:4px; font-weight:600;">' + cat + '</span>' +
@@ -1524,17 +1615,21 @@ app.get('/dashboard', (req, res) => {
           '</div>' +
           '<div class="song-actions">' +
             '<button type="button" class="btn-sm btn-preview" onclick="playMelodyById(\'' + m.id + '\', event)">▶ Dengar</button>' +
-            (!isActive ? '<button type="button" class="btn-sm btn-apply" onclick="applyMelody(\'' + m.id + '\')">Pasang</button>' : '') +
+            (!isActive ? '<button type="button" class="btn-sm btn-apply" onclick="applyMelody(\'' + m.id + '\', event)">Pasang</button>' : '') +
           '</div>' +
         '</div>';
       }).join('');
     }
 
-    async function applyMelody(melodyId) {
+    async function applyMelody(melodyId, ev) {
+      if (ev) ev.stopPropagation();
+      lastSettingChangeTime = Date.now(); // Kunci polling 5 detik
       currentActiveMelodyId = melodyId;
       const m = allMelodies.find(x => x.id === melodyId);
-      if (m) document.getElementById('activeMelodyTitle').textContent = m.name;
+      const titleEl = document.getElementById('activeMelodyTitle');
+      if (titleEl) titleEl.textContent = m ? m.name : melodyId;
       renderMelodyCards();
+      showToast('⏳ Menyimpan lagu: ' + (m ? m.name : melodyId) + '...');
 
       try {
         const res = await fetch('/api/settings', {
@@ -1543,7 +1638,9 @@ app.get('/dashboard', (req, res) => {
           body: JSON.stringify({ melody_id: melodyId })
         });
         if (res.ok) {
-          showToast('✅ Melodi bel diubah: ' + (m ? m.name : melodyId));
+          showToast('✅ Berhasil pasang lagu: ' + (m ? m.name : melodyId));
+        } else {
+          showToast('❌ Gagal menyimpan lagu (' + res.status + ')', false);
         }
       } catch (e) {
         showToast('❌ Gagal memasang lagu!', false);
@@ -1551,8 +1648,11 @@ app.get('/dashboard', (req, res) => {
     }
 
     async function setBuzzerType(type) {
+      lastSettingChangeTime = Date.now(); // Kunci polling 5 detik
       currentBuzzerType = type;
       updateBuzzerTypeUI(type);
+      showToast(type === 'passive' ? '🔊 Mode: Passive Buzzer (3-Pin PWM)' : '🔉 Mode: Active Buzzer (2-Pin Beep)');
+
       try {
         const res = await fetch('/api/settings', {
           method: 'POST',
@@ -1560,16 +1660,19 @@ app.get('/dashboard', (req, res) => {
           body: JSON.stringify({ buzzer_type: type })
         });
         if (res.ok) {
-          showToast(type === 'passive' ? '🔊 Mode: Passive Buzzer (3-Pin PWM)' : '🔉 Mode: Active Buzzer (2-Pin Beep)');
+          showToast(type === 'passive' ? '✅ Buzzer Passive 3-Pin Tersimpan' : '✅ Buzzer Active 2-Pin Tersimpan');
+        } else {
+          showToast('❌ Gagal update tipe buzzer (' + res.status + ')', false);
         }
       } catch (e) {
-        console.error('Gagal update buzzer type', e);
+        showToast('❌ Gagal menghubungi server', false);
       }
     }
 
     function updateBuzzerTypeUI(type) {
       const p = document.getElementById('btnTypePassive');
       const a = document.getElementById('btnTypeActive');
+      if (!p || !a) return;
       if (type === 'passive') {
         p.classList.add('active');
         a.classList.remove('active');
@@ -1614,33 +1717,44 @@ app.get('/dashboard', (req, res) => {
       try {
         const res = await fetch('/api/history', { headers: { 'x-api-key': API_KEY } });
         if (res.status === 401) { logout(); return; }
+        if (!res.ok) return;
 
         const data = await res.json();
 
         updateMuteUI(data.muted);
 
-        if (data.melody_name) document.getElementById('activeMelodyTitle').textContent = data.melody_name;
-        if (data.active_melody && currentActiveMelodyId !== data.active_melody) {
-          currentActiveMelodyId = data.active_melody;
-          renderMelodyCards();
-        }
-        if (data.buzzer_type && currentBuzzerType !== data.buzzer_type) {
-          currentBuzzerType = data.buzzer_type;
-          updateBuzzerTypeUI(data.buzzer_type);
+        // Hanya sinkronkan lagu dan buzzer type jika user TIDAK sedang mengeklik dalam 5 detik terakhir
+        if (Date.now() - lastSettingChangeTime > 5000) {
+          if (data.melody_name) {
+            const titleEl = document.getElementById('activeMelodyTitle');
+            if (titleEl) titleEl.textContent = data.melody_name;
+          }
+          if (data.active_melody && currentActiveMelodyId !== data.active_melody) {
+            currentActiveMelodyId = data.active_melody;
+            renderMelodyCards();
+          }
+          if (data.buzzer_type && currentBuzzerType !== data.buzzer_type) {
+            currentBuzzerType = data.buzzer_type;
+            updateBuzzerTypeUI(data.buzzer_type);
+          }
         }
 
-        document.getElementById('totalAll').textContent = data.total;
+        const totalAll = document.getElementById('totalAll');
+        if (totalAll) totalAll.textContent = data.total;
 
         const today = new Date().toLocaleDateString('id-ID');
-        const todayCount = data.history.filter(h => {
+        const todayCount = (data.history || []).filter(h => {
           return new Date(h.timestamp).toLocaleDateString('id-ID') === today;
         }).length;
-        document.getElementById('totalRings').textContent = todayCount;
+        const totalRings = document.getElementById('totalRings');
+        if (totalRings) totalRings.textContent = todayCount;
 
-        if (data.history.length > 0) {
+        if (data.history && data.history.length > 0) {
           const last = new Date(data.history[0].timestamp);
-          document.getElementById('lastRing').textContent =
-            last.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+          const lastRing = document.getElementById('lastRing');
+          if (lastRing) {
+            lastRing.textContent = last.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+          }
         }
 
         const dot = document.getElementById('statusDot');
@@ -1648,15 +1762,19 @@ app.get('/dashboard', (req, res) => {
         const alertBox = document.getElementById('ringAlert');
 
         if (data.ringing) {
-          dot.classList.add('ringing');
-          statusText.textContent = data.muted ? 'RINGING (MUTE)' : 'RINGING';
-          statusText.style.color = '#f59e0b';
-          alertBox.style.display = 'block';
+          if (dot) dot.classList.add('ringing');
+          if (statusText) {
+            statusText.textContent = data.muted ? 'RINGING (MUTE)' : 'RINGING';
+            statusText.style.color = '#f59e0b';
+          }
+          if (alertBox) alertBox.style.display = 'block';
         } else {
-          dot.classList.remove('ringing');
-          statusText.textContent = 'Online';
-          statusText.style.color = '#94a3b8';
-          alertBox.style.display = 'none';
+          if (dot) dot.classList.remove('ringing');
+          if (statusText) {
+            statusText.textContent = 'Online';
+            statusText.style.color = '#94a3b8';
+          }
+          if (alertBox) alertBox.style.display = 'none';
         }
 
         updateHardwareUI(data.receivers, data.lastClickSerial);
@@ -1664,45 +1782,60 @@ app.get('/dashboard', (req, res) => {
         const tbody = document.getElementById('logBody');
         const emptyState = document.getElementById('emptyState');
 
-        if (data.history.length === 0) {
-          emptyState.style.display = 'block';
-          tbody.innerHTML = '';
+        if (!data.history || data.history.length === 0) {
+          if (emptyState) emptyState.style.display = 'block';
+          if (tbody) tbody.innerHTML = '';
           return;
         }
 
-        emptyState.style.display = 'none';
+        if (emptyState) emptyState.style.display = 'none';
 
-        tbody.innerHTML = data.history.map((entry) => {
-          const d = new Date(entry.timestamp);
-          const time = d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-          const date = d.toLocaleDateString('id-ID', { weekday: 'short', day: 'numeric', month: 'short' });
+        if (tbody) {
+          tbody.innerHTML = data.history.map((entry) => {
+            const d = new Date(entry.timestamp);
+            const time = d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            const date = d.toLocaleDateString('id-ID', { weekday: 'short', day: 'numeric', month: 'short' });
 
-          const isWeb = entry.source === 'Web' || entry.source === 'Web Dashboard';
-          const srcClass = isWeb ? 'badge-src-web' : 'badge-src-btn';
-          const srcLabel = isWeb ? 'Web' : 'Tombol';
+            const isWeb = entry.source === 'Web' || entry.source === 'Web Dashboard';
+            const srcClass = isWeb ? 'badge-src-web' : 'badge-src-btn';
+            const srcLabel = isWeb ? 'Web' : 'Tombol';
 
-          const statusColor = (entry.allowed !== false) ? '#10b981' : '#ef4444';
-          const statusText = (entry.allowed !== false) ? 'Dering #' + (entry.consecutive || 1) : (entry.status_text || 'Hold');
+            const statusColor = (entry.allowed !== false) ? '#10b981' : '#ef4444';
+            const statusText = (entry.allowed !== false) ? 'Dering #' + (entry.consecutive || 1) : (entry.status_text || 'Hold');
 
-          return '<tr>' +
-            '<td style="color:#64748b; font-family:monospace;">#' + entry.id + '</td>' +
-            '<td><span class="badge-src ' + srcClass + '">' + srcLabel + '</span></td>' +
-            '<td><span style="color:' + statusColor + '; font-weight:700;">' + statusText + '</span></td>' +
-            '<td style="font-family:monospace; color:#94a3b8;">' + (entry.serial !== '-' ? '#' + entry.serial : '-') + '</td>' +
-            '<td style="font-family:monospace; color:#f8fafc;">' + time + '</td>' +
-            '<td style="color:#64748b;">' + date + '</td>' +
-          '</tr>';
-        }).join('');
+            return '<tr>' +
+              '<td style="color:#64748b; font-family:monospace;">#' + entry.id + '</td>' +
+              '<td><span class="badge-src ' + srcClass + '">' + srcLabel + '</span></td>' +
+              '<td><span style="color:' + statusColor + '; font-weight:700;">' + statusText + '</span></td>' +
+              '<td style="font-family:monospace; color:#94a3b8;">' + (entry.serial !== '-' ? '#' + entry.serial : '-') + '</td>' +
+              '<td style="font-family:monospace; color:#f8fafc;">' + time + '</td>' +
+              '<td style="color:#64748b;">' + date + '</td>' +
+            '</tr>';
+          }).join('');
+        }
 
       } catch (err) {
-        document.getElementById('statusText').textContent = 'Offline';
-        document.getElementById('statusDot').style.background = '#ef4444';
+        const statusText = document.getElementById('statusText');
+        if (statusText) statusText.textContent = 'Connecting...';
+      }
+    }
+
+    // Polling Loop Sekuensial (Bebas bottleneck antrean request)
+    let isPolling = false;
+    async function pollLoop() {
+      if (!isPolling) {
+        isPolling = true;
+        try {
+          await fetchHistory();
+        } finally {
+          isPolling = false;
+          setTimeout(pollLoop, 2500);
+        }
       }
     }
 
     loadMelodiesCatalog();
-    fetchHistory();
-    setInterval(fetchHistory, 2000);
+    pollLoop();
   </script>
 </body>
 </html>
