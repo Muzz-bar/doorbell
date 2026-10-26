@@ -237,25 +237,42 @@ app.post('/ring', auth, (req, res) => {
   const clickSerial = req.body?.click_serial ?? null;
   const missCount = req.body?.miss ?? 0;
   const receiverId = req.body?.receiver_id || req.headers['x-receiver-id'] || null;
-  let source = req.body?.source || (clickSerial !== null ? 'Tombol (ESP-NOW)' : 'Web');
+  const method = req.body?.method || (clickSerial !== null ? 'ESP-NOW' : 'Web');
+  const allowedByReceiver = req.body?.allowed ?? true;
+  let source = req.body?.source || (clickSerial !== null ? 'Tombol Pager' : 'Web Dashboard');
   if (receiverId && clickSerial !== null) {
-    source = `Tombol (${receiverId})`;
+    const rName = receiverId === 'Receiver_A' ? 'Rumah A' : (receiverId === 'Receiver_B' ? 'Rumah B' : receiverId);
+    source = `Tombol Pager (${rName})`;
   }
 
   // Update telemetry receiver yang melapor
   if (receiverId) {
-    activeReceivers[receiverId] = {
-      name: receiverId,
-      lastSeen: now,
-      ip: req.headers['cf-connecting-ip'] || req.ip || req.connection?.remoteAddress
-    };
+    if (!activeReceivers[receiverId]) activeReceivers[receiverId] = { name: receiverId };
+    activeReceivers[receiverId].lastSeen = now;
+    activeReceivers[receiverId].ip = req.headers['cf-connecting-ip'] || req.ip || req.connection?.remoteAddress;
+    activeReceivers[receiverId].lastRingTime = now;
+    activeReceivers[receiverId].lastRingMethod = method;
+    activeReceivers[receiverId].lastRingStatus = allowedByReceiver ? 'success' : 'spam_hold';
   }
 
   // DEDUKLIKASI MULTI-RECEIVER UNTUK TOMBOL FISIK
-  // Jika Receiver A dan Receiver B sama-sama menerima paket ESP-NOW yang sama
-  // dan keduanya mengirim laporan POST /ring ke server dalam selang waktu < 3.5 detik:
-  if (clickSerial !== null && clickSerial === lastClickSerial && (now - lastClickTimestamp < 3500)) {
-    console.log(`[${new Date(now).toISOString()}] ℹ️ DUPLIKAT DITERIMA: ${receiverId || 'Receiver'} lapor click_serial #${clickSerial} (sudah diproses dari receiver pertama).`);
+  // Jika Receiver A dan Receiver B sama-sama menerima sinyal bel yang sama:
+  if (clickSerial !== null && clickSerial === lastClickSerial && (now - lastClickTimestamp < 4000)) {
+    console.log(`[${new Date(now).toISOString()}] ℹ️ KONFIRMASI RECEIVER TAMBAHAN: ${receiverId || 'Receiver'} lapor click_serial #${clickSerial} via ${method}.`);
+    if (receiverId && ringHistory.length > 0) {
+      const latest = ringHistory[0];
+      if (!latest.receivers_ack) latest.receivers_ack = [];
+      if (!latest.receivers_ack.some(r => r.id === receiverId)) {
+        latest.receivers_ack.push({
+          id: receiverId,
+          name: receiverId === 'Receiver_A' ? 'Rumah A' : (receiverId === 'Receiver_B' ? 'Rumah B' : receiverId),
+          method: method,
+          time: now,
+          allowed: allowedByReceiver
+        });
+        saveState();
+      }
+    }
     return res.json({
       status: 'duplicate_acknowledged',
       ringing: isRinging,
@@ -336,6 +353,7 @@ app.post('/ring', auth, (req, res) => {
   // 4. SELALU CATAT KE RIWAYAT WEB (Bahkan jika di-hold / spam!)
   const entry = {
     id: totalCounter,
+    ring_seq: ringSequence,
     source: source,
     serial: clickSerial !== null ? clickSerial : '-',
     miss: missCount,
@@ -345,6 +363,15 @@ app.post('/ring', auth, (req, res) => {
     status_text: statusText,
     tone: activeTone,
     muted: isMuted,
+    receivers_ack: receiverId ? [
+      {
+        id: receiverId,
+        name: receiverId === 'Receiver_A' ? 'Rumah A' : (receiverId === 'Receiver_B' ? 'Rumah B' : receiverId),
+        method: method,
+        time: now,
+        allowed: allowedByReceiver
+      }
+    ] : [],
     timestamp: new Date(now).toISOString(),
     time_local: new Date(now).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }),
   };
@@ -385,11 +412,11 @@ app.get('/status', auth, (req, res) => {
 
   // Catat telemetry keaktifan receiver
   if (receiverId) {
-    activeReceivers[receiverId] = {
-      name: receiverId,
-      lastSeen: now,
-      ip: req.headers['cf-connecting-ip'] || req.ip || req.connection?.remoteAddress
-    };
+    if (!activeReceivers[receiverId]) {
+      activeReceivers[receiverId] = { name: receiverId };
+    }
+    activeReceivers[receiverId].lastSeen = now;
+    activeReceivers[receiverId].ip = req.headers['cf-connecting-ip'] || req.ip || req.connection?.remoteAddress;
   }
 
   // Timeout pengaman 30 detik jika receiver offline di tengah antrean dering
@@ -416,8 +443,46 @@ app.get('/status', auth, (req, res) => {
     buzzer_type: buzzerType,
     melody_id: activeMelody.id,
     melody_name: activeMelody.name,
-    notes: activeMelody.notes
+    notes: activeMelody.notes,
+    spam_gap_ms: spamGapThresholdMs,
+    spam_max_strikes: spamMaxStrikes,
+    spam_hold_ms: spamHoldDurationMs
   });
+});
+
+// Konfirmasi bunyi dari receiver (ESP-NOW atau Web Sync)
+app.post('/ack_ring', auth, (req, res) => {
+  const now = Date.now();
+  const receiverId = req.body?.receiver_id || 'Unknown';
+  const seq = Number(req.body?.ring_seq) || ringSequence;
+  const method = req.body?.method || 'Web Sync';
+  const allowed = req.body?.allowed !== false;
+
+  if (receiverId && receiverId !== 'Unknown') {
+    if (!activeReceivers[receiverId]) activeReceivers[receiverId] = { name: receiverId };
+    activeReceivers[receiverId].lastSeen = now;
+    activeReceivers[receiverId].ip = req.headers['cf-connecting-ip'] || req.ip || req.connection?.remoteAddress;
+    activeReceivers[receiverId].lastRingTime = now;
+    activeReceivers[receiverId].lastRingMethod = method;
+    activeReceivers[receiverId].lastRingStatus = allowed ? 'success' : 'spam_hold';
+  }
+
+  const entry = ringHistory.find(h => h.ring_seq === seq) || ringHistory[0];
+  if (entry) {
+    if (!entry.receivers_ack) entry.receivers_ack = [];
+    if (!entry.receivers_ack.some(r => r.id === receiverId)) {
+      entry.receivers_ack.push({
+        id: receiverId,
+        name: receiverId === 'Receiver_A' ? 'Rumah A' : receiverId === 'Receiver_B' ? 'Rumah B' : receiverId,
+        method: method,
+        time: now,
+        allowed: allowed
+      });
+      saveState();
+    }
+  }
+
+  return res.json({ status: 'ack_ok', ring_seq: seq });
 });
 
 // Reset status setelah buzzer selesai berbunyi
@@ -1136,21 +1201,23 @@ app.get('/dashboard', (req, res) => {
     <section class="card" style="padding: 14px 16px;">
       <div class="device-grid">
         <!-- Receiver A -->
-        <div class="device-item">
+        <div class="device-item" id="cardReceiverA">
           <div class="device-header">
             <span class="device-name">Receiver A (Rumah A)</span>
             <span id="badgeReceiverA" class="badge-status badge-offline">Offline</span>
           </div>
           <div id="infoReceiverA" class="device-meta">Menunggu polling...</div>
+          <div id="ringReceiverA" class="device-meta" style="margin-top:3px; color:#64748b;">🔊 Belum pernah bunyi</div>
         </div>
 
         <!-- Receiver B -->
-        <div class="device-item">
+        <div class="device-item" id="cardReceiverB">
           <div class="device-header">
             <span class="device-name">Receiver B (Rumah B)</span>
             <span id="badgeReceiverB" class="badge-status badge-offline">Offline</span>
           </div>
           <div id="infoReceiverB" class="device-meta">Menunggu polling...</div>
+          <div id="ringReceiverB" class="device-meta" style="margin-top:3px; color:#64748b;">🔊 Belum pernah bunyi</div>
         </div>
 
         <!-- Transmitter -->
@@ -1695,12 +1762,15 @@ app.get('/dashboard', (req, res) => {
     function updateHardwareUI(receivers, lastClickSerial) {
       const now = Date.now();
 
-      function updateDevice(badgeId, infoId, data) {
+      function updateDevice(cardId, badgeId, infoId, ringId, data, label) {
+        const card = document.getElementById(cardId);
         const badge = document.getElementById(badgeId);
         const info = document.getElementById(infoId);
+        const ringInfo = document.getElementById(ringId);
         if (!badge || !info) return;
 
-        if (data && (now - data.lastSeen < 15000)) {
+        const isOnline = data && (now - data.lastSeen < 15000);
+        if (isOnline) {
           badge.className = 'badge-status badge-online';
           badge.textContent = 'ONLINE';
           const s = Math.max(0, Math.round((now - data.lastSeen) / 1000));
@@ -1710,15 +1780,40 @@ app.get('/dashboard', (req, res) => {
           badge.textContent = 'OFFLINE';
           info.textContent = data ? 'Kontak: ' + new Date(data.lastSeen).toLocaleTimeString('id-ID') : 'Belum pernah polling';
         }
+
+        if (ringInfo) {
+          if (data && data.lastRingTime) {
+            const secAgo = Math.round((now - data.lastRingTime) / 1000);
+            const timeStr = new Date(data.lastRingTime).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+            const isEsp = (data.lastRingMethod === 'ESP-NOW');
+            const methodTag = isEsp ? '⚡ ESP-NOW' : '🌐 Web Sync';
+            const isRingingRecently = (secAgo < 12);
+
+            if (card) {
+              if (isRingingRecently) {
+                card.style.borderColor = '#10b981';
+                card.style.boxShadow = '0 0 12px rgba(16, 185, 129, 0.3)';
+              } else {
+                card.style.borderColor = '#1e293b';
+                card.style.boxShadow = 'none';
+              }
+            }
+
+            ringInfo.innerHTML = '<span style="color:' + (isRingingRecently ? '#10b981' : '#94a3b8') + '; font-weight:' + (isRingingRecently ? '700' : '500') + ';">' +
+              '🔊 Bunyi ' + (isRingingRecently ? 'BARU SAJA' : timeStr) + ' via ' + methodTag + '</span>';
+          } else {
+            ringInfo.innerHTML = '<span style="color:#64748b;">🔊 Belum pernah bunyi</span>';
+          }
+        }
       }
 
-      updateDevice('badgeReceiverA', 'infoReceiverA', receivers ? receivers['Receiver_A'] : null);
-      updateDevice('badgeReceiverB', 'infoReceiverB', receivers ? receivers['Receiver_B'] : null);
+      updateDevice('cardReceiverA', 'badgeReceiverA', 'infoReceiverA', 'ringReceiverA', receivers ? receivers['Receiver_A'] : null, 'Rumah A');
+      updateDevice('cardReceiverB', 'badgeReceiverB', 'infoReceiverB', 'ringReceiverB', receivers ? receivers['Receiver_B'] : null, 'Rumah B');
 
       const infoTx = document.getElementById('infoTransmitter');
       if (infoTx) {
         infoTx.textContent = (lastClickSerial !== null && lastClickSerial !== undefined)
-          ? 'Deep Sleep siaga • Seri #' + lastClickSerial
+          ? 'Deep Sleep siaga • Seri #' + lastClickSerial + ' (ESP-NOW 2.4GHz)'
           : 'Deep Sleep siaga (~5µA) • LED off';
       }
     }
@@ -1806,16 +1901,31 @@ app.get('/dashboard', (req, res) => {
             const time = d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
             const date = d.toLocaleDateString('id-ID', { weekday: 'short', day: 'numeric', month: 'short' });
 
-            const isWeb = entry.source === 'Web' || entry.source === 'Web Dashboard';
+            const isWeb = (entry.source && entry.source.includes('Web'));
             const srcClass = isWeb ? 'badge-src-web' : 'badge-src-btn';
-            const srcLabel = isWeb ? 'Web' : 'Tombol';
+            const srcLabel = isWeb ? 'Web Hub' : 'Tombol Pager';
 
             const statusColor = (entry.allowed !== false) ? '#10b981' : '#ef4444';
             const statusText = (entry.allowed !== false) ? 'Dering #' + (entry.consecutive || 1) : (entry.status_text || 'Hold');
 
+            // Render pill receiver yang berhasil bunyi
+            let rPills = '';
+            if (entry.receivers_ack && entry.receivers_ack.length > 0) {
+              rPills = entry.receivers_ack.map(function(r) {
+                const isEsp = (r.method === 'ESP-NOW');
+                const icon = isEsp ? '⚡' : '🌐';
+                const bg = isEsp ? 'rgba(59, 130, 246, 0.18)' : 'rgba(16, 185, 129, 0.18)';
+                const col = isEsp ? '#60a5fa' : '#34d399';
+                return '<span style="display:inline-block; font-size:10px; padding:1px 6px; border-radius:4px; background:' + bg + '; color:' + col + '; font-weight:600; margin-right:4px; margin-top:3px;">' +
+                  r.name + ' ' + icon + '</span>';
+              }).join('');
+            } else {
+              rPills = '<span style="font-size:10px; color:#64748b;">Standby ACK</span>';
+            }
+
             return '<tr>' +
               '<td style="color:#64748b; font-family:monospace;">#' + entry.id + '</td>' +
-              '<td><span class="badge-src ' + srcClass + '">' + srcLabel + '</span></td>' +
+              '<td><div><span class="badge-src ' + srcClass + '">' + srcLabel + '</span></div><div style="margin-top:2px;">' + rPills + '</div></td>' +
               '<td><span style="color:' + statusColor + '; font-weight:700;">' + statusText + '</span></td>' +
               '<td style="font-family:monospace; color:#94a3b8;">' + (entry.serial !== '-' ? '#' + entry.serial : '-') + '</td>' +
               '<td style="font-family:monospace; color:#f8fafc;">' + time + '</td>' +
