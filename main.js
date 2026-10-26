@@ -1604,7 +1604,7 @@ app.get('/dashboard', (req, res) => {
         const isActive = (m.id === currentActiveMelodyId);
         const cat = catBadges[m.category] || m.category;
 
-        return '<div class="song-card ' + (isActive ? 'active-song' : '') + '" onclick="applyMelody(\'' + m.id + '\')" style="cursor:pointer; touch-action:manipulation;">' +
+        return '<div class="song-card ' + (isActive ? 'active-song' : '') + '" data-id="' + m.id + '" onclick="applyMelody(this.dataset.id)" style="cursor:pointer; touch-action:manipulation;">' +
           '<div>' +
             '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
               '<span style="font-size:10px; background:#1e293b; color:#94a3b8; padding:1px 6px; border-radius:4px; font-weight:600;">' + cat + '</span>' +
@@ -1614,11 +1614,21 @@ app.get('/dashboard', (req, res) => {
             '<div class="song-info-meta">' + m.noteCount + ' ketukan nada</div>' +
           '</div>' +
           '<div class="song-actions">' +
-            '<button type="button" class="btn-sm btn-preview" onclick="playMelodyById(\'' + m.id + '\', event)">▶ Dengar</button>' +
-            (!isActive ? '<button type="button" class="btn-sm btn-apply" onclick="applyMelody(\'' + m.id + '\', event)">Pasang</button>' : '') +
+            '<button type="button" class="btn-sm btn-preview" data-id="' + m.id + '" onclick="previewCard(this, event)">▶ Dengar</button>' +
+            (!isActive ? '<button type="button" class="btn-sm btn-apply" data-id="' + m.id + '" onclick="applyCard(this, event)">Pasang</button>' : '') +
           '</div>' +
         '</div>';
       }).join('');
+    }
+
+    function previewCard(btn, ev) {
+      if (ev) ev.stopPropagation();
+      playMelodyById(btn.dataset.id);
+    }
+
+    function applyCard(btn, ev) {
+      if (ev) ev.stopPropagation();
+      applyMelody(btn.dataset.id);
     }
 
     async function applyMelody(melodyId, ev) {
