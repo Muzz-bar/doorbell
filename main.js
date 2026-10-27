@@ -68,6 +68,7 @@ const MAX_HISTORY = 200;
 let lastClickSerial = null;
 let lastClickTimestamp = 0;
 let activeReceivers = {}; // id -> { name, lastSeen, ip }
+let receiverVolumes = { Receiver_A: 100, Receiver_B: 100 }; // Volume 0 - 100% per unit
 let transmitterBattery = null; // { mv: 4120, pct: 92, voltage: '4.12', lastUpdated: Date.now() }
 
 // Aturan Anti-Spam Cerdas (Dapat Diubah Dinamis dari Web Dashboard & Tersimpan Permanen):
@@ -120,6 +121,7 @@ function loadState() {
       if (typeof rawData.ringSequence === 'number') ringSequence = rawData.ringSequence;
       if (Array.isArray(rawData.ringHistory)) ringHistory = rawData.ringHistory;
       if (rawData.transmitterBattery) transmitterBattery = rawData.transmitterBattery;
+      if (rawData.receiverVolumes) receiverVolumes = Object.assign(receiverVolumes, rawData.receiverVolumes);
 
       // Pengaturan anti-spam dinamis yang disimpan pengguna:
       if (rawData.spamGapThresholdMs !== undefined) spamGapThresholdMs = Math.max(500, Number(rawData.spamGapThresholdMs) || 3000);
@@ -160,6 +162,7 @@ function saveState() {
       spamMaxStrikes,
       spamHoldDurationMs,
       transmitterBattery,
+      receiverVolumes,
       lastSaved: new Date().toISOString()
     };
 
@@ -457,6 +460,8 @@ app.get('/status', auth, (req, res) => {
     notes: [[659, 125], [659, 125], [0, 125], [659, 125], [0, 125], [523, 125], [659, 125], [0, 125], [784, 250]]
   };
 
+  const rVol = (receiverId && receiverVolumes[receiverId] !== undefined) ? receiverVolumes[receiverId] : 100;
+
   return res.json({
     ringing: isRinging,
     ring_seq: ringSequence,
@@ -468,6 +473,7 @@ app.get('/status', auth, (req, res) => {
     melody_id: activeMelody.id,
     melody_name: activeMelody.name,
     notes: activeMelody.notes,
+    volume: rVol,
     spam_gap_ms: spamGapThresholdMs,
     spam_max_strikes: spamMaxStrikes,
     spam_hold_ms: spamHoldDurationMs
@@ -575,6 +581,20 @@ app.post('/api/settings', auth, (req, res) => {
   });
 });
 
+// Endpoint Pengaturan Volume Buzzer per Receiver
+app.post('/api/volume', auth, (req, res) => {
+  const receiverId = req.body?.receiver_id || req.body?.id;
+  const vol = Math.max(0, Math.min(100, Number(req.body?.volume) || 100));
+  if (receiverId) {
+    receiverVolumes[receiverId] = vol;
+  } else {
+    Object.keys(receiverVolumes).forEach(k => receiverVolumes[k] = vol);
+  }
+  saveState();
+  console.log(`[${new Date().toISOString()}] 🔊 VOLUME DIUBAH: ${receiverId || 'Semua'} = ${vol}%`);
+  return res.json({ status: 'ok', receiverVolumes });
+});
+
 // Endpoint Daftar 52 Lagu Jukebox (Ringan tanpa dump notes besar agar load instan <100ms)
 app.get('/api/melodies', auth, (req, res) => {
   ensureMelodiesLoaded();
@@ -618,6 +638,7 @@ app.get('/api/history', auth, (req, res) => {
     maxStrikes: spamMaxStrikes,
     holdDurationSec: spamHoldDurationMs / 1000,
     receivers: activeReceivers,
+    receiverVolumes: receiverVolumes,
     battery: transmitterBattery,
     lastClickSerial: lastClickSerial,
     history: ringHistory,
@@ -1233,6 +1254,11 @@ app.get('/dashboard', (req, res) => {
           </div>
           <div id="infoReceiverA" class="device-meta">Menunggu polling...</div>
           <div id="ringReceiverA" class="device-meta" style="margin-top:3px; color:#64748b;">🔊 Belum pernah bunyi</div>
+          <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
+            <span style="font-size:11px; color:#94a3b8; font-weight:600;">🔊 Vol:</span>
+            <input type="range" id="volSliderA" min="10" max="100" step="5" value="100" style="flex:1; accent-color:#3b82f6; cursor:pointer;" onchange="changeVolume('Receiver_A', this.value)" oninput="document.getElementById('volValA').textContent = this.value + '%'">
+            <span id="volValA" style="font-size:11px; color:#60a5fa; font-weight:700; min-width:32px;">100%</span>
+          </div>
         </div>
 
         <!-- Receiver B -->
@@ -1243,6 +1269,11 @@ app.get('/dashboard', (req, res) => {
           </div>
           <div id="infoReceiverB" class="device-meta">Menunggu polling...</div>
           <div id="ringReceiverB" class="device-meta" style="margin-top:3px; color:#64748b;">🔊 Belum pernah bunyi</div>
+          <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
+            <span style="font-size:11px; color:#94a3b8; font-weight:600;">🔊 Vol:</span>
+            <input type="range" id="volSliderB" min="10" max="100" step="5" value="100" style="flex:1; accent-color:#3b82f6; cursor:pointer;" onchange="changeVolume('Receiver_B', this.value)" oninput="document.getElementById('volValB').textContent = this.value + '%'">
+            <span id="volValB" style="font-size:11px; color:#60a5fa; font-weight:700; min-width:32px;">100%</span>
+          </div>
         </div>
 
         <!-- Transmitter -->
@@ -1786,7 +1817,7 @@ app.get('/dashboard', (req, res) => {
       }
     }
 
-    function updateHardwareUI(receivers, lastClickSerial, battery) {
+    function updateHardwareUI(receivers, lastClickSerial, battery, volumes) {
       const now = Date.now();
 
       function updateDevice(cardId, badgeId, infoId, ringId, data, label) {
@@ -1837,6 +1868,22 @@ app.get('/dashboard', (req, res) => {
       updateDevice('cardReceiverA', 'badgeReceiverA', 'infoReceiverA', 'ringReceiverA', receivers ? receivers['Receiver_A'] : null, 'Rumah A');
       updateDevice('cardReceiverB', 'badgeReceiverB', 'infoReceiverB', 'ringReceiverB', receivers ? receivers['Receiver_B'] : null, 'Rumah B');
 
+      // Update Slider Volume
+      if (volumes) {
+        const sliderA = document.getElementById('volSliderA');
+        const valA = document.getElementById('volValA');
+        if (sliderA && valA && document.activeElement !== sliderA && volumes['Receiver_A'] !== undefined) {
+          sliderA.value = volumes['Receiver_A'];
+          valA.textContent = volumes['Receiver_A'] + '%';
+        }
+        const sliderB = document.getElementById('volSliderB');
+        const valB = document.getElementById('volValB');
+        if (sliderB && valB && document.activeElement !== sliderB && volumes['Receiver_B'] !== undefined) {
+          sliderB.value = volumes['Receiver_B'];
+          valB.textContent = volumes['Receiver_B'] + '%';
+        }
+      }
+
       const infoTx = document.getElementById('infoTransmitter');
       const batTx = document.getElementById('batteryTransmitter');
       if (infoTx) {
@@ -1855,6 +1902,20 @@ app.get('/dashboard', (req, res) => {
           batTx.innerHTML = '<span style="color:#64748b;">🔋 Baterai: Standby (Pasang 2x R 100kΩ untuk monitor %)</span>';
         }
       }
+    }
+
+    async function changeVolume(receiverId, vol) {
+      showToast('⏳ Volume ' + (receiverId === 'Receiver_A' ? 'Rumah A' : 'Rumah B') + ' diubah ke ' + vol + '%...');
+      try {
+        const res = await fetch('/api/volume', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+          body: JSON.stringify({ receiver_id: receiverId, volume: Number(vol) })
+        });
+        if (res.ok) {
+          showToast('✅ Volume ' + (receiverId === 'Receiver_A' ? 'Rumah A' : 'Rumah B') + ' tersimpan (' + vol + '%)');
+        }
+      } catch(_) {}
     }
 
     async function fetchHistory() {
@@ -1921,7 +1982,7 @@ app.get('/dashboard', (req, res) => {
           if (alertBox) alertBox.style.display = 'none';
         }
 
-        updateHardwareUI(data.receivers, data.lastClickSerial, data.battery);
+        updateHardwareUI(data.receivers, data.lastClickSerial, data.battery, data.receiverVolumes);
 
         const tbody = document.getElementById('logBody');
         const emptyState = document.getElementById('emptyState');
