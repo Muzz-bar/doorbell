@@ -58,11 +58,23 @@ let lastActiveRingTime = 0;
 let isMuted = false;
 let activeTone = 1; // Fallback legacy
 let activeMelodyId = 'mario_bros'; // Default lagu: Super Mario Bros
+let activeMelodyMode = 'short'; // 'short' (36 nada standar bel) atau 'full' (lagu penuh sampai tamat)
+let melodyLengthSettings = {};  // id -> 'short' | 'full'
 let buzzerType = 'passive'; // 'passive' (Passive Buzzer PWM 3-Pin) atau 'active' (Active Buzzer Beep)
 let customPattern = [250, 120, 250, 120, 500];
 let totalCounter = 0; // Counter ID unik abadi (tidak duplikat saat > 200)
 let ringHistory = [];
 const MAX_HISTORY = 200;
+
+// Helper nada melodi berdasarkan mode durasi (Ringkas ~36 nada vs Penuh)
+function getNotesForMelody(melody, mode = 'short') {
+  if (!melody || !Array.isArray(melody.notes)) return [];
+  if (mode === 'full') {
+    return melody.notes;
+  }
+  const limit = melody.shortCount || Math.min(36, melody.notes.length);
+  return melody.notes.slice(0, limit);
+}
 
 // Tracking Multi-Receiver & Deduplikasi ESP-NOW
 let lastClickSerial = null;
@@ -113,6 +125,10 @@ function loadState() {
       if (typeof rawData.isMuted === 'boolean') isMuted = rawData.isMuted;
       if (typeof rawData.activeTone === 'number') activeTone = Number(rawData.activeTone);
       if (typeof rawData.activeMelodyId === 'string') activeMelodyId = rawData.activeMelodyId;
+      if (typeof rawData.activeMelodyMode === 'string') activeMelodyMode = rawData.activeMelodyMode;
+      if (rawData.melodyLengthSettings && typeof rawData.melodyLengthSettings === 'object') {
+        melodyLengthSettings = rawData.melodyLengthSettings;
+      }
       if (typeof rawData.buzzerType === 'string') buzzerType = rawData.buzzerType;
       if (Array.isArray(rawData.customPattern) && rawData.customPattern.length > 0) {
         customPattern = rawData.customPattern;
@@ -153,6 +169,8 @@ function saveState() {
       isMuted,
       activeTone,
       activeMelodyId,
+      activeMelodyMode,
+      melodyLengthSettings,
       buzzerType,
       customPattern,
       totalCounter,
@@ -457,9 +475,12 @@ app.get('/status', auth, (req, res) => {
   const activeMelody = allMelodies.find(m => m.id === activeMelodyId) || allMelodies[0] || {
     id: 'mario_bros',
     name: 'Super Mario Bros',
+    shortCount: 36,
     notes: [[659, 125], [659, 125], [0, 125], [659, 125], [0, 125], [523, 125], [659, 125], [0, 125], [784, 250]]
   };
 
+  const currentMode = melodyLengthSettings[activeMelody.id] || activeMelodyMode || 'short';
+  const notesToSend = getNotesForMelody(activeMelody, currentMode);
   const rVol = (receiverId && receiverVolumes[receiverId] !== undefined) ? receiverVolumes[receiverId] : 100;
 
   return res.json({
@@ -472,7 +493,9 @@ app.get('/status', auth, (req, res) => {
     buzzer_type: buzzerType,
     melody_id: activeMelody.id,
     melody_name: activeMelody.name,
-    notes: activeMelody.notes,
+    melody_mode: currentMode,
+    note_count: notesToSend.length,
+    notes: notesToSend,
     volume: rVol,
     spam_gap_ms: spamGapThresholdMs,
     spam_max_strikes: spamMaxStrikes,
@@ -542,6 +565,12 @@ app.post('/api/settings', auth, (req, res) => {
       activeMelodyId = targetId;
     }
   }
+  if (req.body.melody_mode === 'short' || req.body.melody_mode === 'full') {
+    activeMelodyMode = req.body.melody_mode;
+    if (activeMelodyId) {
+      melodyLengthSettings[activeMelodyId] = req.body.melody_mode;
+    }
+  }
   if (req.body.buzzer_type === 'passive' || req.body.buzzer_type === 'active') {
     buzzerType = req.body.buzzer_type;
   }
@@ -572,6 +601,7 @@ app.post('/api/settings', auth, (req, res) => {
     muted: isMuted,
     tone: activeTone,
     melody_id: activeMelodyId,
+    melody_mode: activeMelodyMode,
     melody_name: currentMelodyName,
     buzzer_type: buzzerType,
     pattern: customPattern,
@@ -598,14 +628,23 @@ app.post('/api/volume', auth, (req, res) => {
 // Endpoint Daftar 52 Lagu Jukebox (Ringan tanpa dump notes besar agar load instan <100ms)
 app.get('/api/melodies', auth, (req, res) => {
   ensureMelodiesLoaded();
-  const summary = allMelodies.map(m => ({
-    id: m.id,
-    name: m.name,
-    category: m.category,
-    noteCount: m.noteCount
-  }));
+  const summary = allMelodies.map(m => {
+    const defaultMode = (m.totalNotes <= 36 ? 'full' : 'short');
+    const userMode = melodyLengthSettings[m.id] || defaultMode;
+    return {
+      id: m.id,
+      name: m.name,
+      category: m.category,
+      totalNotes: m.totalNotes || (m.notes ? m.notes.length : 36),
+      shortCount: m.shortCount || Math.min(36, m.totalNotes || 36),
+      shortDurationSec: m.shortDurationSec || 8,
+      fullDurationSec: m.fullDurationSec || 20,
+      selectedMode: userMode
+    };
+  });
   return res.json({
     active_melody: activeMelodyId,
+    active_mode: activeMelodyMode,
     buzzer_type: buzzerType,
     total: allMelodies.length,
     melodies: summary
@@ -617,7 +656,15 @@ app.get('/api/melody/:id', auth, (req, res) => {
   ensureMelodiesLoaded();
   const m = allMelodies.find(x => x.id === req.params.id);
   if (!m) return res.status(404).json({ error: 'Melody not found' });
-  return res.json({ id: m.id, name: m.name, notes: m.notes });
+  const reqMode = req.query.mode || melodyLengthSettings[m.id] || 'short';
+  const notes = getNotesForMelody(m, reqMode);
+  return res.json({
+    id: m.id,
+    name: m.name,
+    mode: reqMode,
+    noteCount: notes.length,
+    notes: notes
+  });
 });
 
 // API Riwayat & Pengaturan untuk Dashboard Web
@@ -631,7 +678,9 @@ app.get('/api/history', auth, (req, res) => {
     muted: isMuted,
     tone: activeTone,
     active_melody: activeMelodyId,
+    active_mode: activeMelodyMode,
     melody_name: currentMelodyName,
+    melody_settings: melodyLengthSettings,
     buzzer_type: buzzerType,
     pattern: customPattern,
     spamGapSec: spamGapThresholdMs / 1000,
@@ -1094,6 +1143,57 @@ app.get('/dashboard', (req, res) => {
       font-size: 11px;
       color: #64748b;
     }
+    .mode-selector {
+      display: flex;
+      gap: 4px;
+      margin-top: 6px;
+      background: #090e1a;
+      padding: 2px;
+      border-radius: 6px;
+      border: 1px solid #1e293b;
+    }
+    .mode-pill {
+      flex: 1;
+      padding: 4px 5px;
+      font-size: 10px;
+      font-weight: 600;
+      background: transparent;
+      border: none;
+      color: #94a3b8;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      text-align: center;
+      line-height: 1.2;
+    }
+    .mode-pill:hover { color: #f8fafc; }
+    .mode-pill.active {
+      background: #2563eb;
+      color: #ffffff;
+    }
+    .mode-pill.active-full {
+      background: #d97706;
+      color: #ffffff;
+    }
+    .mode-pill.active-extreme {
+      background: #dc2626;
+      color: #ffffff;
+    }
+    .song-warning-box {
+      margin-top: 6px;
+      padding: 5px 8px;
+      border-radius: 6px;
+      background: rgba(217, 119, 6, 0.12);
+      border: 1px solid rgba(217, 119, 6, 0.35);
+      color: #fbbf24;
+      font-size: 10px;
+      line-height: 1.35;
+    }
+    .song-warning-box.extreme {
+      background: rgba(220, 38, 38, 0.12);
+      border: 1px solid rgba(220, 38, 38, 0.35);
+      color: #f87171;
+    }
     .song-actions {
       display: flex;
       gap: 6px;
@@ -1466,6 +1566,8 @@ app.get('/dashboard', (req, res) => {
     let allMelodies = [];
     let notesCache = {}; // Cache nada lagu yang sudah di-fetch agar preview instan
     let currentActiveMelodyId = 'mario_bros';
+    let currentActiveMelodyMode = 'short';
+    let localMelodyModes = {};
     let currentBuzzerType = 'passive';
     let selectedCategory = 'all';
     let audioCtx = null;
@@ -1628,24 +1730,41 @@ app.get('/dashboard', (req, res) => {
       }
     }
 
-    async function playMelodyById(id, ev) {
-      if (ev) ev.stopPropagation();
-      const m = allMelodies.find(x => x.id === id);
-      showToast('▶ Memuat suara: ' + (m ? m.name : id));
+    function updateActiveMelodyBanner(m, mode) {
+      const titleEl = document.getElementById('activeMelodyTitle');
+      if (!titleEl) return;
+      const name = m ? m.name : currentActiveMelodyId;
+      const chosenMode = mode || (m && m.totalNotes <= 36 ? 'full' : (localMelodyModes[currentActiveMelodyId] || currentActiveMelodyMode || 'short'));
+      if (chosenMode === 'full' && m && m.totalNotes > 36) {
+        const isExtreme = (m.fullDurationSec >= 60);
+        titleEl.innerHTML = name + ' <span style="font-size:11px; font-weight:600; padding:2px 7px; border-radius:4px; background:' + (isExtreme ? 'rgba(220,38,38,0.2); color:#f87171;' : 'rgba(217,119,6,0.2); color:#fbbf24;') + ' border:1px solid ' + (isExtreme ? 'rgba(220,38,38,0.4);' : 'rgba(217,119,6,0.4);') + ' margin-left:6px;">' + (isExtreme ? '🚨 Penuh: ' + m.totalNotes + ' nada (~' + Math.round(m.fullDurationSec/60*10)/10 + 'm)' : '⚠️ Penuh: ' + m.totalNotes + ' nada (~' + m.fullDurationSec + 's)') + '</span>';
+      } else {
+        const notesCount = m ? (m.totalNotes <= 36 ? m.totalNotes : m.shortCount) : 36;
+        const sec = m ? (m.totalNotes <= 36 ? m.fullDurationSec : m.shortDurationSec) : 8;
+        titleEl.innerHTML = name + ' <span style="font-size:11px; font-weight:600; padding:2px 7px; border-radius:4px; background:rgba(16,185,129,0.15); color:#34d399; border:1px solid rgba(16,185,129,0.3); margin-left:6px;">⚡ ' + (m && m.totalNotes <= 36 ? 'Lengkap: ' : 'Ringkas: ') + notesCount + ' nada (~' + sec + 's)</span>';
+      }
+    }
 
-      if (notesCache[id]) {
-        playMelodyPreview(notesCache[id]);
+    async function playMelodyById(id, mode = null, ev = null) {
+      if (ev) ev.stopPropagation();
+      const chosenMode = mode || localMelodyModes[id] || (allMelodies.find(x => x.id === id)?.totalNotes <= 36 ? 'full' : 'short');
+      const cacheKey = id + '_' + chosenMode;
+      const m = allMelodies.find(x => x.id === id);
+      showToast('▶ Memuat suara: ' + (m ? m.name : id) + ' [' + (chosenMode === 'full' ? 'Penuh' : 'Ringkas') + ']');
+
+      if (notesCache[cacheKey]) {
+        playMelodyPreview(notesCache[cacheKey]);
         return;
       }
 
       try {
-        const res = await fetch('/api/melody/' + encodeURIComponent(id), {
+        const res = await fetch('/api/melody/' + encodeURIComponent(id) + '?mode=' + encodeURIComponent(chosenMode), {
           headers: { 'x-api-key': API_KEY }
         });
         if (res.ok) {
           const data = await res.json();
           if (data.notes) {
-            notesCache[id] = data.notes;
+            notesCache[cacheKey] = data.notes;
             playMelodyPreview(data.notes);
           }
         } else {
@@ -1657,7 +1776,7 @@ app.get('/dashboard', (req, res) => {
     }
 
     function previewCurrentActiveMelody() {
-      playMelodyById(currentActiveMelodyId);
+      playMelodyById(currentActiveMelodyId, currentActiveMelodyMode);
     }
 
     async function loadMelodiesCatalog() {
@@ -1671,6 +1790,12 @@ app.get('/dashboard', (req, res) => {
         if (res.ok) {
           const data = await res.json();
           allMelodies = data.melodies || [];
+          allMelodies.forEach(m => {
+            if (!localMelodyModes[m.id]) {
+              localMelodyModes[m.id] = m.selectedMode || (m.totalNotes <= 36 ? 'full' : 'short');
+            }
+          });
+          if (data.active_mode) currentActiveMelodyMode = data.active_mode;
           if (data.active_melody && Date.now() - lastSettingChangeTime > 5000) {
             currentActiveMelodyId = data.active_melody;
           }
@@ -1679,8 +1804,7 @@ app.get('/dashboard', (req, res) => {
             updateBuzzerTypeUI(data.buzzer_type);
           }
           const m = allMelodies.find(x => x.id === currentActiveMelodyId);
-          const titleEl = document.getElementById('activeMelodyTitle');
-          if (titleEl) titleEl.textContent = m ? m.name : currentActiveMelodyId;
+          updateActiveMelodyBanner(m, currentActiveMelodyMode);
           renderMelodyCards();
         } else if (res.status === 401) {
           logout();
@@ -1702,6 +1826,12 @@ app.get('/dashboard', (req, res) => {
     }
 
     function filterMelodies() {
+      renderMelodyCards();
+    }
+
+    function selectCardMode(id, mode, ev) {
+      if (ev) ev.stopPropagation();
+      localMelodyModes[id] = mode;
       renderMelodyCards();
     }
 
@@ -1728,52 +1858,93 @@ app.get('/dashboard', (req, res) => {
       container.innerHTML = filtered.map(m => {
         const isActive = (m.id === currentActiveMelodyId);
         const cat = catBadges[m.category] || m.category;
+        const currentMode = localMelodyModes[m.id] || (m.totalNotes <= 36 ? 'full' : 'short');
+        const isFull = (currentMode === 'full');
+        const hasChoice = (m.totalNotes > 36);
+        const isLong = hasChoice && isFull && (m.fullDurationSec >= 15);
+        const isExtreme = hasChoice && isFull && (m.fullDurationSec >= 60);
 
-        return '<div class="song-card ' + (isActive ? 'active-song' : '') + '" data-id="' + m.id + '" onclick="applyMelody(this.dataset.id)" style="cursor:pointer; touch-action:manipulation;">' +
+        let choiceHtml = '';
+        if (hasChoice) {
+          choiceHtml = '<div class="mode-selector" onclick="event.stopPropagation()">' +
+            '<button type="button" class="mode-pill ' + (!isFull ? 'active' : '') + '" onclick="selectCardMode(\'' + m.id + '\', \'short\', event)">⚡ Ringkas (' + m.shortCount + ' nada ~' + m.shortDurationSec + 's)</button>' +
+            '<button type="button" class="mode-pill ' + (isFull ? (isExtreme ? 'active-extreme' : 'active-full') : '') + '" onclick="selectCardMode(\'' + m.id + '\', \'full\', event)">🔥 Penuh (' + m.totalNotes + ' nada ~' + m.fullDurationSec + 's)</button>' +
+          '</div>';
+        } else {
+          choiceHtml = '<div style="font-size:10px; color:#10b981; font-weight:600; margin-top:5px; display:flex; align-items:center; gap:4px;">' +
+            '<span>✓</span> Lagu Lengkap (' + m.totalNotes + ' nada ~' + m.fullDurationSec + 's)' +
+          '</div>';
+        }
+
+        let warningHtml = '';
+        if (isExtreme) {
+          warningHtml = '<div class="song-warning-box extreme">' +
+            '🚨 <b>Peringatan Ekstrem:</b> Lagu berbunyi <b>~' + Math.round(m.fullDurationSec/60*10)/10 + ' menit (' + m.totalNotes + ' nada)</b> non-stop! Bel rumah akan berbunyi sangat lama.' +
+          '</div>';
+        } else if (isLong) {
+          warningHtml = '<div class="song-warning-box">' +
+            '⚠️ <b>Peringatan:</b> Berbunyi <b>~' + m.fullDurationSec + ' detik</b> non-stop. Selama berbunyi bel tidak bisa dipencet ulang.' +
+          '</div>';
+        }
+
+        return '<div class="song-card ' + (isActive ? 'active-song' : '') + '" data-id="' + m.id + '">' +
           '<div>' +
             '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">' +
               '<span style="font-size:10px; background:#1e293b; color:#94a3b8; padding:1px 6px; border-radius:4px; font-weight:600;">' + cat + '</span>' +
               (isActive ? '<span style="font-size:10px; background:#10b981; color:white; padding:1px 6px; border-radius:4px; font-weight:700;">AKTIF</span>' : '') +
             '</div>' +
             '<div class="song-info-title">' + m.name + '</div>' +
-            '<div class="song-info-meta">' + m.noteCount + ' ketukan nada</div>' +
+            '<div class="song-info-meta">' + m.totalNotes + ' ketukan total • Durasi ~' + m.fullDurationSec + 's</div>' +
+            choiceHtml +
+            warningHtml +
           '</div>' +
-          '<div class="song-actions">' +
-            '<button type="button" class="btn-sm btn-preview" data-id="' + m.id + '" onclick="previewCard(this, event)">▶ Dengar</button>' +
-            (!isActive ? '<button type="button" class="btn-sm btn-apply" data-id="' + m.id + '" onclick="applyCard(this, event)">Pasang</button>' : '') +
+          '<div class="song-actions" style="margin-top:8px;">' +
+            '<button type="button" class="btn-sm btn-preview" data-id="' + m.id + '" onclick="previewCard(\'' + m.id + '\', event)">▶ Dengar</button>' +
+            '<button type="button" class="btn-sm btn-apply" data-id="' + m.id + '" onclick="applyCard(\'' + m.id + '\', event)">' + (isActive ? 'Simpan Pilihan' : 'Pasang') + '</button>' +
           '</div>' +
         '</div>';
       }).join('');
     }
 
-    function previewCard(btn, ev) {
+    function previewCard(id, ev) {
       if (ev) ev.stopPropagation();
-      playMelodyById(btn.dataset.id);
+      const mode = localMelodyModes[id] || (allMelodies.find(x => x.id === id)?.totalNotes <= 36 ? 'full' : 'short');
+      playMelodyById(id, mode);
     }
 
-    function applyCard(btn, ev) {
+    function applyCard(id, ev) {
       if (ev) ev.stopPropagation();
-      applyMelody(btn.dataset.id);
+      const mode = localMelodyModes[id] || (allMelodies.find(x => x.id === id)?.totalNotes <= 36 ? 'full' : 'short');
+      applyMelody(id, mode);
     }
 
-    async function applyMelody(melodyId, ev) {
+    async function applyMelody(melodyId, mode = null, ev = null) {
       if (ev) ev.stopPropagation();
       lastSettingChangeTime = Date.now(); // Kunci polling 5 detik
-      currentActiveMelodyId = melodyId;
       const m = allMelodies.find(x => x.id === melodyId);
-      const titleEl = document.getElementById('activeMelodyTitle');
-      if (titleEl) titleEl.textContent = m ? m.name : melodyId;
+      const chosenMode = mode || localMelodyModes[melodyId] || (m && m.totalNotes <= 36 ? 'full' : 'short');
+      localMelodyModes[melodyId] = chosenMode;
+      currentActiveMelodyId = melodyId;
+      currentActiveMelodyMode = chosenMode;
+
+      updateActiveMelodyBanner(m, chosenMode);
       renderMelodyCards();
-      showToast('⏳ Menyimpan lagu: ' + (m ? m.name : melodyId) + '...');
+
+      const durText = m ? (chosenMode === 'full' ? m.fullDurationSec + 's (Penuh)' : m.shortDurationSec + 's (Ringkas)') : '';
+      if (chosenMode === 'full' && m && m.fullDurationSec >= 15) {
+        showToast('⚠️ Pasang Lagu Penuh: ' + (m ? m.name : melodyId) + ' (~' + durText + '). Perhatian: durasi panjang!');
+      } else {
+        showToast('⏳ Menyimpan lagu: ' + (m ? m.name : melodyId) + ' (' + durText + ')...');
+      }
 
       try {
         const res = await fetch('/api/settings', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
-          body: JSON.stringify({ melody_id: melodyId })
+          body: JSON.stringify({ melody_id: melodyId, melody_mode: chosenMode })
         });
         if (res.ok) {
-          showToast('✅ Berhasil pasang lagu: ' + (m ? m.name : melodyId));
+          showToast('✅ Berhasil pasang: ' + (m ? m.name : melodyId) + ' [' + (chosenMode === 'full' ? 'Penuh' : 'Ringkas') + ']');
         } else {
           showToast('❌ Gagal menyimpan lagu (' + res.status + ')', false);
         }
@@ -1930,12 +2101,11 @@ app.get('/dashboard', (req, res) => {
 
         // Hanya sinkronkan lagu dan buzzer type jika user TIDAK sedang mengeklik dalam 5 detik terakhir
         if (Date.now() - lastSettingChangeTime > 5000) {
-          if (data.melody_name) {
-            const titleEl = document.getElementById('activeMelodyTitle');
-            if (titleEl) titleEl.textContent = data.melody_name;
-          }
-          if (data.active_melody && currentActiveMelodyId !== data.active_melody) {
+          if (data.active_melody && (currentActiveMelodyId !== data.active_melody || (data.active_mode && currentActiveMelodyMode !== data.active_mode))) {
             currentActiveMelodyId = data.active_melody;
+            if (data.active_mode) currentActiveMelodyMode = data.active_mode;
+            const m = allMelodies.find(x => x.id === currentActiveMelodyId);
+            updateActiveMelodyBanner(m, currentActiveMelodyMode);
             renderMelodyCards();
           }
           if (data.buzzer_type && currentBuzzerType !== data.buzzer_type) {
