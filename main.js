@@ -1829,8 +1829,12 @@ app.get('/dashboard', (req, res) => {
       renderMelodyCards();
     }
 
-    function selectCardMode(id, mode, ev) {
+    function selectCardMode(btn, ev) {
       if (ev) ev.stopPropagation();
+      const card = btn.closest('.song-card');
+      if (!card) return;
+      const id = card.dataset.id;
+      const mode = btn.dataset.mode;
       localMelodyModes[id] = mode;
       renderMelodyCards();
     }
@@ -1867,8 +1871,8 @@ app.get('/dashboard', (req, res) => {
         let choiceHtml = '';
         if (hasChoice) {
           choiceHtml = '<div class="mode-selector" onclick="event.stopPropagation()">' +
-            '<button type="button" class="mode-pill ' + (!isFull ? 'active' : '') + '" onclick="selectCardMode(\'' + m.id + '\', \'short\', event)">⚡ Ringkas (' + m.shortCount + ' nada ~' + m.shortDurationSec + 's)</button>' +
-            '<button type="button" class="mode-pill ' + (isFull ? (isExtreme ? 'active-extreme' : 'active-full') : '') + '" onclick="selectCardMode(\'' + m.id + '\', \'full\', event)">🔥 Penuh (' + m.totalNotes + ' nada ~' + m.fullDurationSec + 's)</button>' +
+            '<button type="button" class="mode-pill ' + (!isFull ? 'active' : '') + '" data-mode="short" onclick="selectCardMode(this, event)">⚡ Ringkas (' + m.shortCount + ' nada ~' + m.shortDurationSec + 's)</button>' +
+            '<button type="button" class="mode-pill ' + (isFull ? (isExtreme ? 'active-extreme' : 'active-full') : '') + '" data-mode="full" onclick="selectCardMode(this, event)">🔥 Penuh (' + m.totalNotes + ' nada ~' + m.fullDurationSec + 's)</button>' +
           '</div>';
         } else {
           choiceHtml = '<div style="font-size:10px; color:#10b981; font-weight:600; margin-top:5px; display:flex; align-items:center; gap:4px;">' +
@@ -1899,21 +1903,27 @@ app.get('/dashboard', (req, res) => {
             warningHtml +
           '</div>' +
           '<div class="song-actions" style="margin-top:8px;">' +
-            '<button type="button" class="btn-sm btn-preview" data-id="' + m.id + '" onclick="previewCard(\'' + m.id + '\', event)">▶ Dengar</button>' +
-            '<button type="button" class="btn-sm btn-apply" data-id="' + m.id + '" onclick="applyCard(\'' + m.id + '\', event)">' + (isActive ? 'Simpan Pilihan' : 'Pasang') + '</button>' +
+            '<button type="button" class="btn-sm btn-preview" onclick="previewCard(this, event)">▶ Dengar</button>' +
+            '<button type="button" class="btn-sm btn-apply" onclick="applyCard(this, event)">' + (isActive ? 'Simpan Pilihan' : 'Pasang') + '</button>' +
           '</div>' +
         '</div>';
       }).join('');
     }
 
-    function previewCard(id, ev) {
+    function previewCard(btn, ev) {
       if (ev) ev.stopPropagation();
+      const card = btn.closest('.song-card');
+      if (!card) return;
+      const id = card.dataset.id;
       const mode = localMelodyModes[id] || (allMelodies.find(x => x.id === id)?.totalNotes <= 36 ? 'full' : 'short');
       playMelodyById(id, mode);
     }
 
-    function applyCard(id, ev) {
+    function applyCard(btn, ev) {
       if (ev) ev.stopPropagation();
+      const card = btn.closest('.song-card');
+      if (!card) return;
+      const id = card.dataset.id;
       const mode = localMelodyModes[id] || (allMelodies.find(x => x.id === id)?.totalNotes <= 36 ? 'full' : 'short');
       applyMelody(id, mode);
     }
