@@ -1,0 +1,12 @@
+{
+  "name": "doorbell-hub",
+  "version": "7.0.0",
+  "description": "Smart Doorbell Hub & Control Center with ESP-NOW and Wi-Fi Mesh",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

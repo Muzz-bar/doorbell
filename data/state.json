@@ -1,7 +1,26 @@
 {
   "isMuted": false,
   "activeTone": 1,
+  "activeMelodyId": "mario_bros",
+  "activeMelodyMode": "short",
+  "melodyLengthSettings": {},
+  "buzzerType": "passive",
+  "customPattern": [
+    250,
+    120,
+    250,
+    120,
+    500
+  ],
+  "totalCounter": 0,
+  "ringSequence": 0,
+  "ringHistory": [],
   "spamGapThresholdMs": 3000,
   "spamMaxStrikes": 5,
-  "spamHoldDurationMs": 15000
+  "spamHoldDurationMs": 15000,
+  "transmitterBattery": null,
+  "receiverVolumes": {
+    "Receiver_A": 100,
+    "Receiver_B": 100
+}
 }

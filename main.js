@@ -51,18 +51,18 @@ ensureMelodiesLoaded();
 
 // State Bel & Konfigurasi Default (Akan ditimpa oleh pengaturan terakhir di state.json)
 let isRinging = false;
-let pendingRings = 0; // Antrean dering aktif agar dering cepat numpuk dan bunyi berurutan
-let ringSequence = 0; // Nomor urut dering unik agar Multi-Receiver (Receiver A & B) bisa bunyi serentak
+let pendingRings = 0;
+let ringSequence = 0;
 let lastRingTime = 0;
 let lastActiveRingTime = 0;
 let isMuted = false;
-let activeTone = 1; // Fallback legacy
-let activeMelodyId = 'mario_bros'; // Default lagu: Super Mario Bros
-let activeMelodyMode = 'short'; // 'short' (36 nada standar bel) atau 'full' (lagu penuh sampai tamat)
-let melodyLengthSettings = {};  // id -> 'short' | 'full'
-let buzzerType = 'passive'; // 'passive' (Passive Buzzer PWM 3-Pin) atau 'active' (Active Buzzer Beep)
+let activeTone = 1;
+let activeMelodyId = 'mario_bros';
+let activeMelodyMode = 'short';
+let melodyLengthSettings = {};
+let buzzerType = 'passive'; // 'passive' (3-Pin PWM) atau 'active' (2-Pin Beep)
 let customPattern = [250, 120, 250, 120, 500];
-let totalCounter = 0; // Counter ID unik abadi (tidak duplikat saat > 200)
+let totalCounter = 0;
 let ringHistory = [];
 const MAX_HISTORY = 200;
 
@@ -76,23 +76,31 @@ function getNotesForMelody(melody, mode = 'short') {
   return melody.notes.slice(0, limit);
 }
 
+// Helper persentase baterai 18650 dari tegangan millivolt
+function calculatePctFromMv(mv) {
+  if (!mv || mv <= 0) return null;
+  if (mv >= 4200) return 100;
+  if (mv <= 3200) return 0;
+  return Math.round(((mv - 3200) * 100) / (4200 - 3200));
+}
+
 // Tracking Multi-Receiver & Deduplikasi ESP-NOW
 let lastClickSerial = null;
 let lastClickTimestamp = 0;
-let activeReceivers = {}; // id -> { name, lastSeen, ip }
-let receiverVolumes = { Receiver_A: 100, Receiver_B: 100 }; // Volume 0 - 100% per unit
+let activeReceivers = {}; // id -> { name, lastSeen, ip, lastRingTime, lastRingMethod, lastRingStatus }
+let receiverVolumes = { Receiver_A: 100, Receiver_B: 100 }; // Volume 10 - 100% per unit
 let transmitterBattery = null; // { mv: 4120, pct: 92, voltage: '4.12', lastUpdated: Date.now() }
 
-// Aturan Anti-Spam Cerdas (Dapat Diubah Dinamis dari Web Dashboard & Tersimpan Permanen):
-let spamGapThresholdMs = 3000;   // Jeda 3 detik untuk mendeteksi spam
-let spamMaxStrikes = 5;          // Maksimal 5x spam beruntun sebelum hold
-let spamHoldDurationMs = 15000;  // Durasi hold 15 detik
+// Aturan Anti-Spam Cerdas
+let spamGapThresholdMs = 3000;
+let spamMaxStrikes = 5;
+let spamHoldDurationMs = 15000;
 
 let lastRingTimestamp = 0;
 let consecutiveSpamCount = 0;
 let holdUntilTimestamp = 0;
 
-// ========== FUNGSI PERSISTENCE PERMANEN (ATOMIC WRITE & ANTI-KORUP) ==========
+// ========== FUNGSI PERSISTENCE PERMANEN (ATOMIC WRITE) ==========
 
 function loadState() {
   try {
@@ -101,7 +109,6 @@ function loadState() {
     let rawData = null;
     let fileLoaded = null;
 
-    // 1. Coba baca file state.json utama
     if (fs.existsSync(STATE_FILE)) {
       try {
         rawData = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
@@ -111,7 +118,6 @@ function loadState() {
       }
     }
 
-    // 2. Fallback otomatis ke file backup jika file utama korup
     if (!rawData && fs.existsSync(BACKUP_FILE)) {
       try {
         rawData = JSON.parse(fs.readFileSync(BACKUP_FILE, 'utf8'));
@@ -120,7 +126,6 @@ function loadState() {
       } catch (_) {}
     }
 
-    // 3. Terapkan seluruh pengaturan terakhir jika ditemukan
     if (rawData) {
       if (typeof rawData.isMuted === 'boolean') isMuted = rawData.isMuted;
       if (typeof rawData.activeTone === 'number') activeTone = Number(rawData.activeTone);
@@ -139,20 +144,17 @@ function loadState() {
       if (rawData.transmitterBattery) transmitterBattery = rawData.transmitterBattery;
       if (rawData.receiverVolumes) receiverVolumes = Object.assign(receiverVolumes, rawData.receiverVolumes);
 
-      // Pengaturan anti-spam dinamis yang disimpan pengguna:
       if (rawData.spamGapThresholdMs !== undefined) spamGapThresholdMs = Math.max(500, Number(rawData.spamGapThresholdMs) || 3000);
       if (rawData.spamMaxStrikes !== undefined) spamMaxStrikes = Math.max(1, Number(rawData.spamMaxStrikes) || 5);
       if (rawData.spamHoldDurationMs !== undefined) spamHoldDurationMs = Math.max(1000, Number(rawData.spamHoldDurationMs) || 15000);
 
       console.log(`📂 Pengaturan terakhir berhasil dimuat dari ${fileLoaded}:`);
       console.log(`   • Mode Senyap: ${isMuted ? '🔇 Muted' : '🔊 Unmuted'}`);
-      console.log(`   • Pilihan Nada: Tone ${activeTone}`);
+      console.log(`   • Lagu Aktif: ${activeMelodyId}`);
       console.log(`   • Batas Jeda Spam: ${spamGapThresholdMs / 1000} detik`);
       console.log(`   • Jatah Dering Bebas: ${spamMaxStrikes} kali`);
-      console.log(`   • Durasi Hold Buzzer: ${spamHoldDurationMs / 1000} detik`);
-      console.log(`   • Total Riwayat Tersimpan: ${ringHistory.length} dering`);
+      console.log(`   • Total Riwayat: ${ringHistory.length} dering`);
     } else {
-      // File belum ada (misal instalasi baru), simpan pengaturan default sekarang juga
       console.log('ℹ️ Belum ada state tersimpan. Membuat file data/state.json awal...');
       saveState();
     }
@@ -186,26 +188,20 @@ function saveState() {
 
     const payload = JSON.stringify(data, null, 2);
 
-    // ATOMIC WRITE: Tulis ke file temporary terlebih dahulu
     fs.writeFileSync(TEMP_FILE, payload, 'utf8');
-
-    // Buat cadangan file lama
     if (fs.existsSync(STATE_FILE)) {
       try {
         fs.copyFileSync(STATE_FILE, BACKUP_FILE);
       } catch (_) {}
     }
-
-    // Rename atomik: file tidak akan pernah terpotong di tengah jalan meskipun server mendadak mati
     fs.renameSync(TEMP_FILE, STATE_FILE);
   } catch (err) {
     console.error('❌ Gagal menyimpan state.json:', err.message);
   }
 }
 
-// Simpan state secara aman saat container Docker / proses Node dihentikan
 function gracefulShutdown(signal) {
-  console.log(`\n🛑 Menerima sinyal ${signal}. Memastikan pengaturan terakhir tersimpan ke disk...`);
+  console.log(`\n🛑 Menerima sinyal ${signal}. Memastikan pengaturan tersimpan ke disk...`);
   saveState();
   process.exit(0);
 }
@@ -278,10 +274,17 @@ app.post('/ring', auth, (req, res) => {
     source = `Tombol Pager (${rName})`;
   }
 
-  // Update data baterai transmitter jika dikirimkan oleh receiver
+  // Update data baterai transmitter jika dikirimkan oleh transmitter atau receiver
   const vbatMv = Number(req.body?.vbat_mv) || null;
-  const batteryPct = (req.body?.battery_pct !== undefined && req.body?.battery_pct !== null && Number(req.body.battery_pct) <= 100) ? Number(req.body.battery_pct) : null;
-  if (vbatMv && batteryPct !== null) {
+  let rawPct = (req.body?.battery_pct !== undefined && req.body?.battery_pct !== null) ? Number(req.body.battery_pct) : null;
+  let batteryPct = null;
+  if (rawPct !== null && rawPct <= 100) {
+    batteryPct = rawPct;
+  } else if (vbatMv) {
+    batteryPct = calculatePctFromMv(vbatMv);
+  }
+
+  if (vbatMv) {
     transmitterBattery = {
       mv: vbatMv,
       pct: batteryPct,
@@ -300,7 +303,7 @@ app.post('/ring', auth, (req, res) => {
     activeReceivers[receiverId].lastRingStatus = allowedByReceiver ? 'success' : 'spam_hold';
   }
 
-  // DEDUKLIKASI MULTI-RECEIVER UNTUK TOMBOL FISIK
+  // DEDUPLIKASI MULTI-RECEIVER UNTUK TOMBOL FISIK
   // Jika Receiver A dan Receiver B sama-sama menerima sinyal bel yang sama:
   if (clickSerial !== null && clickSerial === lastClickSerial && (now - lastClickTimestamp < 4000)) {
     console.log(`[${new Date(now).toISOString()}] ℹ️ KONFIRMASI RECEIVER TAMBAHAN: ${receiverId || 'Receiver'} lapor click_serial #${clickSerial} via ${method}.`);
@@ -342,50 +345,40 @@ app.post('/ring', auth, (req, res) => {
   let ringAllowed = false;
   let statusText = '';
 
-  // Cek apakah sedang dalam masa HOLD (15 detik) akibat spam sebelumnya
   const isUnderHold = (now < holdUntilTimestamp);
 
   if (isUnderHold) {
-    // ── SEDANG DALAM MASA HOLD 15 DETIK ──
     const remainingSec = Math.ceil((holdUntilTimestamp - now) / 1000);
     consecutiveSpamCount++;
     ringAllowed = false;
     statusText = `Spam Ditahan (${remainingSec}s)`;
     console.log(`[${new Date(now).toISOString()}] 🚫 SPAM HOLD [${source}]: Jeda ${timeSinceLast}ms | Sisa hold: ${remainingSec}s | Buzzer diam.`);
   } else {
-    // ── TIDAK SEDANG HOLD: EVALUASI JEDA WAKTU ──
     if (timeSinceLast <= spamGapThresholdMs) {
-      // Jeda <= batas threshold: INI TERDETEKSI SPAM CEPAT / BERUNTUN!
       consecutiveSpamCount++;
       console.log(`[${new Date(now).toISOString()}] ⚡ RAPID CLICK [${source}]: Jeda ${timeSinceLast}ms (<= ${spamGapThresholdMs}ms) | Rentetan spam: #${consecutiveSpamCount}`);
 
       if (consecutiveSpamCount <= spamMaxStrikes) {
-        // Masih dalam kuota dering bebas: DIIZINKAN BUNYI!
         ringAllowed = true;
         statusText = `Dering #${consecutiveSpamCount}/${spamMaxStrikes}`;
 
-        // Tepat di pencetan batas: Aktifkan HOLD untuk pencetan spam berikutnya!
         if (consecutiveSpamCount === spamMaxStrikes) {
           holdUntilTimestamp = now + spamHoldDurationMs;
-          console.log(`[${new Date(now).toISOString()}] 🛑 SPAM LIMIT: Kuota ${spamMaxStrikes}x berturut tercapai! Hold ${spamHoldDurationMs/1000} detik diaktifkan.`);
+          console.log(`[${new Date(now).toISOString()}] 🛑 SPAM LIMIT: Kuota ${spamMaxStrikes}x berturut tercapai! Hold ${spamHoldDurationMs/1000}s diaktifkan.`);
         }
       } else {
-        // Melebihi batas jatah: Buzzer ditahan
         ringAllowed = false;
         holdUntilTimestamp = now + spamHoldDurationMs;
         statusText = `Spam Ditahan (Hold ${Math.round(spamHoldDurationMs/1000)}s)`;
       }
     } else {
-      // Jeda > batas threshold (atau pencetan pertama / tamu santai): BUKAN SPAM!
-      // Hitungan spam di-reset kembali ke 1 (Dering Normal)
       consecutiveSpamCount = 1;
       ringAllowed = true;
       statusText = `Dering #1/${spamMaxStrikes} (Normal)`;
-      console.log(`[${new Date(now).toISOString()}] 🔔 NORMAL RING [${source}]: Jeda ${timeSinceLast}ms (> ${spamGapThresholdMs}ms) | Bukan spam, bel berbunyi.`);
+      console.log(`[${new Date(now).toISOString()}] 🔔 NORMAL RING [${source}]: Jeda ${timeSinceLast}ms (> ${spamGapThresholdMs}ms) | Bel berbunyi.`);
     }
   }
 
-  // 3. Jika diizinkan bunyi, naikkan nomor urut dering (ringSequence)
   if (ringAllowed) {
     ringSequence++;
     pendingRings = Math.min(5, pendingRings + 1);
@@ -395,7 +388,6 @@ app.post('/ring', auth, (req, res) => {
 
   totalCounter++;
 
-  // 4. SELALU CATAT KE RIWAYAT WEB (Bahkan jika di-hold / spam!)
   const entry = {
     id: totalCounter,
     ring_seq: ringSequence,
@@ -428,7 +420,6 @@ app.post('/ring', auth, (req, res) => {
 
   saveState();
 
-  // Kirim notifikasi bot Telegram/Discord:
   if (ringAllowed || consecutiveSpamCount === spamMaxStrikes + 1) {
     sendPushNotification(entry);
   }
@@ -455,7 +446,6 @@ app.get('/status', auth, (req, res) => {
   const now = Date.now();
   const receiverId = req.query.id || req.query.receiver || req.headers['x-receiver-id'] || null;
 
-  // Catat telemetry keaktifan receiver
   if (receiverId) {
     if (!activeReceivers[receiverId]) {
       activeReceivers[receiverId] = { name: receiverId };
@@ -464,14 +454,12 @@ app.get('/status', auth, (req, res) => {
     activeReceivers[receiverId].ip = req.headers['cf-connecting-ip'] || req.ip || req.connection?.remoteAddress;
   }
 
-  // Timeout pengaman 30 detik jika receiver offline di tengah antrean dering
   if (isRinging && now - lastActiveRingTime > 30000) {
     isRinging = false;
     pendingRings = 0;
   }
 
   ensureMelodiesLoaded();
-  // Cari lagu aktif dari database 52 lagu
   const activeMelody = allMelodies.find(m => m.id === activeMelodyId) || allMelodies[0] || {
     id: 'mario_bros',
     name: 'Super Mario Bros',
@@ -538,18 +526,18 @@ app.post('/ack_ring', auth, (req, res) => {
   return res.json({ status: 'ack_ok', ring_seq: seq });
 });
 
-// Reset status setelah buzzer selesai berbunyi
+// Reset status setelah dering selesai
 app.post('/reset', auth, (req, res) => {
   lastActiveRingTime = Date.now();
   if (pendingRings > 0) {
     pendingRings--;
   }
   isRinging = (pendingRings > 0);
-  console.log(`[${new Date().toISOString()}] ✅ RESET: Siklus dering selesai. (Sisa antrean dering: ${pendingRings})`);
+  console.log(`[${new Date().toISOString()}] ✅ RESET: Siklus dering selesai. (Sisa antrean: ${pendingRings})`);
   return res.json({ status: 'reset_ok', ringing: isRinging, pending: pendingRings });
 });
 
-// API Update Pengaturan (Mute, Nada, Lagu Melodi Jukebox, Buzzer Type, & Anti-Spam) dari Web
+// API Update Pengaturan (Mute, Nada, Lagu Melodi Jukebox, Buzzer Type, & Anti-Spam)
 app.post('/api/settings', auth, (req, res) => {
   ensureMelodiesLoaded();
 
@@ -580,7 +568,6 @@ app.post('/api/settings', auth, (req, res) => {
       .slice(0, 24);
   }
 
-  // Pengaturan Anti-Spam Dinamis:
   if (req.body.spamGapSec !== undefined) {
     const sec = Math.max(0.5, Math.min(60, Number(req.body.spamGapSec) || 3));
     spamGapThresholdMs = Math.round(sec * 1000);
@@ -595,7 +582,7 @@ app.post('/api/settings', auth, (req, res) => {
 
   saveState();
   const currentMelodyName = (allMelodies.find(m => m.id === activeMelodyId) || {}).name || activeMelodyId;
-  console.log(`[${new Date().toISOString()}] ⚙️ PENGATURAN DIUBAH: Melody=${currentMelodyName} (${activeMelodyId}), BuzzerType=${buzzerType}, Mute=${isMuted}, SpamGap=${spamGapThresholdMs}ms`);
+  console.log(`[${new Date().toISOString()}] ⚙️ PENGATURAN DIUBAH: Melody=${currentMelodyName} (${activeMelodyId}), BuzzerType=${buzzerType}, Mute=${isMuted}`);
   return res.json({
     status: 'ok',
     muted: isMuted,
@@ -625,7 +612,7 @@ app.post('/api/volume', auth, (req, res) => {
   return res.json({ status: 'ok', receiverVolumes });
 });
 
-// Endpoint Daftar 52 Lagu Jukebox (Ringan tanpa dump notes besar agar load instan <100ms)
+// Endpoint Daftar 52 Lagu Jukebox (Ringan tanpa notes besar)
 app.get('/api/melodies', auth, (req, res) => {
   ensureMelodiesLoaded();
   const summary = allMelodies.map(m => {
@@ -651,7 +638,7 @@ app.get('/api/melodies', auth, (req, res) => {
   });
 });
 
-// Endpoint Nada untuk Preview Lagu Spesifik (Dipanggil hanya saat tombol Dengar ditekan)
+// Endpoint Preview Lagu Spesifik
 app.get('/api/melody/:id', auth, (req, res) => {
   ensureMelodiesLoaded();
   const m = allMelodies.find(x => x.id === req.params.id);
@@ -694,21 +681,28 @@ app.get('/api/history', auth, (req, res) => {
   });
 });
 
-// ========== WEB UI ==========
+// Endpoint Bersihkan Riwayat
+app.post('/api/clear_history', auth, (req, res) => {
+  ringHistory = [];
+  saveState();
+  console.log(`[${new Date().toISOString()}] 🗑️ RIWAYAT DIBERSIHKAN`);
+  return res.json({ status: 'ok', message: 'Riwayat berhasil dibersihkan' });
+});
+
+// ========== WEB UI: LOGIN & DASHBOARD ==========
 
 app.get('/', (req, res) => {
-  res.send(`
-<!DOCTYPE html>
+  res.send(`<!DOCTYPE html>
 <html lang="id">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>🔔 Doorbell Login</title>
+  <title>🔔 Doorbell Login — Studio Hub</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: 'Segoe UI', system-ui, sans-serif;
-      background: #0b1329;
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+      background: #090d16;
       color: #e2e8f0;
       display: flex;
       justify-content: center;
@@ -717,97 +711,128 @@ app.get('/', (req, res) => {
       padding: 16px;
     }
     .login-box {
-      background: #1e293b;
-      border: 1px solid #334155;
-      border-radius: 20px;
-      padding: 40px 32px;
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 16px;
+      padding: 36px 28px;
       width: 100%;
       max-width: 380px;
       text-align: center;
-      box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+      box-shadow: 0 20px 40px rgba(0,0,0,0.6);
     }
-    .login-box h1 { font-size: 3em; margin-bottom: 12px; }
-    .login-box h2 { font-size: 1.4em; font-weight: 700; margin-bottom: 6px; }
-    .login-box p { color: #94a3b8; font-size: 14px; margin-bottom: 24px; }
+    .icon-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 60px;
+      height: 60px;
+      background: rgba(59, 130, 246, 0.12);
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      border-radius: 14px;
+      font-size: 28px;
+      margin-bottom: 16px;
+    }
+    .login-box h2 { font-size: 1.35em; font-weight: 700; color: #f8fafc; margin-bottom: 6px; letter-spacing: -0.3px; }
+    .login-box p { color: #94a3b8; font-size: 13px; margin-bottom: 24px; line-height: 1.4; }
     input[type="password"] {
       width: 100%;
-      padding: 14px 16px;
-      border: 1px solid #475569;
-      border-radius: 10px;
-      background: #0f172a;
-      color: #e2e8f0;
-      font-size: 15px;
-      margin-bottom: 16px;
+      padding: 12px 14px;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      background: #141e33;
+      color: #f8fafc;
+      font-size: 14px;
+      margin-bottom: 14px;
       outline: none;
       transition: all 0.2s;
     }
     input[type="password"]:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.2); }
     button {
       width: 100%;
-      padding: 14px;
-      background: #3b82f6;
+      padding: 12px;
+      background: #2563eb;
       color: white;
       border: none;
-      border-radius: 10px;
-      font-size: 16px;
+      border-radius: 8px;
+      font-size: 14px;
       font-weight: 600;
       cursor: pointer;
       transition: background 0.2s, transform 0.1s;
     }
-    button:hover { background: #2563eb; }
+    button:hover { background: #1d4ed8; }
     button:active { transform: scale(0.98); }
     .error {
       color: #f87171;
       margin-top: 14px;
       display: none;
-      font-size: 14px;
+      font-size: 13px;
       font-weight: 500;
     }
   </style>
 </head>
 <body>
   <div class="login-box">
-    <h1>🔔</h1>
-    <h2>Smart Doorbell</h2>
-    <p>Masukkan API Key untuk mengakses kontrol & riwayat</p>
+    <div class="icon-badge">🔔</div>
+    <h2>Doorbell Studio Hub</h2>
+    <p>Masukkan API Key server untuk mengakses kontrol perangkat & riwayat dering.</p>
     <form id="loginForm">
-      <input type="password" id="apiKey" placeholder="API Key Server" required autocomplete="off">
-      <button type="submit">Masuk ke Dashboard</button>
+      <input type="password" id="apiKey" placeholder="API Key Server" required autocomplete="current-password">
+      <button type="submit" id="btnSubmit">Masuk ke Dashboard</button>
     </form>
     <p class="error" id="errorMsg">❌ API Key salah / tidak valid!</p>
   </div>
   <script>
+    // Auto-login jika kunci tersimpan masih valid
+    (async function checkExistingKey() {
+      const stored = sessionStorage.getItem('doorbell_key') || localStorage.getItem('doorbell_key');
+      if (stored) {
+        try {
+          const check = await fetch('/status', { headers: { 'x-api-key': stored } });
+          if (check.status === 200) {
+            sessionStorage.setItem('doorbell_key', stored);
+            window.location.href = '/dashboard';
+          }
+        } catch (_) {}
+      }
+    })();
+
     document.getElementById('loginForm').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const key = document.getElementById('apiKey').value;
+      const key = document.getElementById('apiKey').value.trim();
+      const btn = document.getElementById('btnSubmit');
+      btn.textContent = 'Memverifikasi...';
+      btn.disabled = true;
 
       try {
         const check = await fetch('/status', { headers: { 'x-api-key': key } });
         if (check.status === 200) {
           sessionStorage.setItem('doorbell_key', key);
+          localStorage.setItem('doorbell_key', key);
           window.location.href = '/dashboard';
         } else {
           document.getElementById('errorMsg').style.display = 'block';
+          btn.textContent = 'Masuk ke Dashboard';
+          btn.disabled = false;
         }
       } catch (err) {
         document.getElementById('errorMsg').textContent = 'Gagal terhubung ke server!';
         document.getElementById('errorMsg').style.display = 'block';
+        btn.textContent = 'Masuk ke Dashboard';
+        btn.disabled = false;
       }
     });
   </script>
 </body>
-</html>
-  `);
+</html>`);
 });
 
 app.get('/dashboard', (req, res) => {
-  res.send(`
-<!DOCTYPE html>
+  res.send(`<!DOCTYPE html>
 <html lang="id">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Doorbell Hub & Studio</title>
+  <title>Doorbell Studio Hub & Control Center</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -818,12 +843,12 @@ app.get('/dashboard', (req, res) => {
       padding-bottom: 60px;
       -webkit-font-smoothing: antialiased;
     }
-    
+
     /* Top Bar */
     .topbar {
       background: #0f172a;
       border-bottom: 1px solid #1e293b;
-      padding: 14px 24px;
+      padding: 12px 20px;
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -843,17 +868,26 @@ app.get('/dashboard', (req, res) => {
     }
     .brand-pill {
       font-size: 10px;
-      background: #1e293b;
-      color: #94a3b8;
+      background: #141e33;
+      color: #38bdf8;
       padding: 2px 7px;
       border-radius: 9999px;
-      font-weight: 600;
-      border: 1px solid #334155;
+      font-weight: 700;
+      border: 1px solid rgba(56, 189, 248, 0.25);
     }
     .topbar-actions {
       display: flex;
       align-items: center;
       gap: 14px;
+    }
+    .clock-pill {
+      font-size: 11px;
+      font-family: monospace;
+      color: #94a3b8;
+      background: #141e33;
+      padding: 4px 8px;
+      border-radius: 6px;
+      border: 1px solid #1e293b;
     }
     .status-indicator {
       display: flex;
@@ -873,7 +907,7 @@ app.get('/dashboard', (req, res) => {
     }
     .status-dot.ringing {
       background: #f59e0b;
-      box-shadow: 0 0 12px rgba(245, 158, 11, 0.8);
+      box-shadow: 0 0 14px rgba(245, 158, 11, 0.9);
       animation: ring-pulse 0.4s infinite;
     }
     @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.9); } }
@@ -894,25 +928,26 @@ app.get('/dashboard', (req, res) => {
     /* Ring Alert Banner */
     .ring-alert {
       display: none;
-      background: #f59e0b;
-      color: #0f172a;
+      background: linear-gradient(90deg, #d97706, #f59e0b, #d97706);
+      color: #090d16;
       text-align: center;
       padding: 12px;
       font-weight: 800;
       font-size: 14px;
-      letter-spacing: 0.5px;
-      animation: flash-bg 0.7s infinite alternate;
+      letter-spacing: 0.3px;
+      animation: flash-bg 0.8s infinite alternate;
+      border-bottom: 1px solid rgba(0,0,0,0.2);
     }
     @keyframes flash-bg { from { opacity: 1; } to { opacity: 0.85; } }
 
     /* Layout */
     .container {
-      max-width: 860px;
-      margin: 20px auto;
+      max-width: 920px;
+      margin: 18px auto;
       padding: 0 16px;
       display: flex;
       flex-direction: column;
-      gap: 18px;
+      gap: 16px;
     }
 
     /* Cards */
@@ -920,8 +955,8 @@ app.get('/dashboard', (req, res) => {
       background: #0f172a;
       border: 1px solid #1e293b;
       border-radius: 14px;
-      padding: 18px;
-      box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+      padding: 16px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
     }
     .card-title {
       font-size: 13px;
@@ -936,23 +971,24 @@ app.get('/dashboard', (req, res) => {
     .card-subtitle {
       font-size: 12px;
       color: #64748b;
-      margin-bottom: 14px;
+      margin-bottom: 12px;
     }
 
     /* Hardware Network Strip */
     .device-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 10px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
     }
     .device-item {
       background: #141e33;
       border: 1px solid #1e293b;
-      border-radius: 10px;
-      padding: 12px 14px;
+      border-radius: 12px;
+      padding: 14px;
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 6px;
+      transition: border-color 0.2s, box-shadow 0.2s;
     }
     .device-header {
       display: flex;
@@ -978,11 +1014,29 @@ app.get('/dashboard', (req, res) => {
     .badge-online { background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); }
     .badge-offline { background: rgba(239, 68, 68, 0.15); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.3); }
 
-    /* Bento 2-Col Actions */
+    /* Battery Meter Bar */
+    .battery-meter-container {
+      margin-top: 6px;
+      background: #090e1a;
+      border-radius: 6px;
+      height: 8px;
+      overflow: hidden;
+      border: 1px solid #1e293b;
+      position: relative;
+    }
+    .battery-meter-fill {
+      height: 100%;
+      width: 0%;
+      background: #10b981;
+      border-radius: 6px;
+      transition: width 0.4s ease, background 0.4s ease;
+    }
+
+    /* Bento Actions */
     .action-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 14px;
+      gap: 12px;
     }
     @media (max-width: 640px) { .action-grid { grid-template-columns: 1fr; } }
 
@@ -1108,7 +1162,7 @@ app.get('/dashboard', (req, res) => {
     /* Song Grid */
     .song-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
       gap: 10px;
       max-height: 380px;
       overflow-y: auto;
@@ -1167,18 +1221,10 @@ app.get('/dashboard', (req, res) => {
       line-height: 1.2;
     }
     .mode-pill:hover { color: #f8fafc; }
-    .mode-pill.active {
-      background: #2563eb;
-      color: #ffffff;
-    }
-    .mode-pill.active-full {
-      background: #d97706;
-      color: #ffffff;
-    }
-    .mode-pill.active-extreme {
-      background: #dc2626;
-      color: #ffffff;
-    }
+    .mode-pill.active { background: #2563eb; color: #ffffff; }
+    .mode-pill.active-full { background: #d97706; color: #ffffff; }
+    .mode-pill.active-extreme { background: #dc2626; color: #ffffff; }
+
     .song-warning-box {
       margin-top: 6px;
       padding: 5px 8px;
@@ -1217,6 +1263,11 @@ app.get('/dashboard', (req, res) => {
       border-color: #334155;
     }
     .btn-preview:hover { background: #334155; color: #f8fafc; }
+    .btn-preview.playing {
+      background: #d97706;
+      color: white;
+      border-color: #f59e0b;
+    }
     .btn-apply {
       background: #10b981;
       color: white;
@@ -1321,19 +1372,30 @@ app.get('/dashboard', (req, res) => {
     }
     .badge-src-web { background: rgba(139, 92, 246, 0.15); color: #a78bfa; }
     .badge-src-btn { background: rgba(59, 130, 246, 0.15); color: #60a5fa; }
+    .btn-clear-history {
+      background: transparent;
+      border: 1px solid #334155;
+      color: #94a3b8;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .btn-clear-history:hover { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
   </style>
 </head>
 <body>
-  <div class="ring-alert" id="ringAlert">BEL SEDANG BERBUNYI</div>
+  <div class="ring-alert" id="ringAlert">🔔 BEL PINTU SEDANG BERBUNYI!</div>
 
   <!-- Top Bar -->
   <header class="topbar">
     <div class="topbar-brand">
       <span>🔔</span>
-      <span>Doorbell Hub</span>
-      <span class="brand-pill">v6.1</span>
+      <span>Doorbell Studio Hub</span>
+      <span class="brand-pill">v8.0</span>
     </div>
     <div class="topbar-actions">
+      <div class="clock-pill" id="liveClock">00:00:00 WIB</div>
       <div class="status-indicator">
         <div class="status-dot" id="statusDot"></div>
         <span id="statusText">Online</span>
@@ -1343,7 +1405,7 @@ app.get('/dashboard', (req, res) => {
   </header>
 
   <main class="container">
-    <!-- Status Hardware Network Strip -->
+    <!-- Status Hardware Network Mesh Strip -->
     <section class="card" style="padding: 14px 16px;">
       <div class="device-grid">
         <!-- Receiver A -->
@@ -1353,7 +1415,7 @@ app.get('/dashboard', (req, res) => {
             <span id="badgeReceiverA" class="badge-status badge-offline">Offline</span>
           </div>
           <div id="infoReceiverA" class="device-meta">Menunggu polling...</div>
-          <div id="ringReceiverA" class="device-meta" style="margin-top:3px; color:#64748b;">🔊 Belum pernah bunyi</div>
+          <div id="ringReceiverA" class="device-meta" style="margin-top:2px; color:#64748b;">🔊 Belum pernah bunyi</div>
           <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
             <span style="font-size:11px; color:#94a3b8; font-weight:600;">🔊 Vol:</span>
             <input type="range" id="volSliderA" min="10" max="100" step="5" value="100" style="flex:1; accent-color:#3b82f6; cursor:pointer;" onchange="changeVolume('Receiver_A', this.value)" oninput="document.getElementById('volValA').textContent = this.value + '%'">
@@ -1368,7 +1430,7 @@ app.get('/dashboard', (req, res) => {
             <span id="badgeReceiverB" class="badge-status badge-offline">Offline</span>
           </div>
           <div id="infoReceiverB" class="device-meta">Menunggu polling...</div>
-          <div id="ringReceiverB" class="device-meta" style="margin-top:3px; color:#64748b;">🔊 Belum pernah bunyi</div>
+          <div id="ringReceiverB" class="device-meta" style="margin-top:2px; color:#64748b;">🔊 Belum pernah bunyi</div>
           <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
             <span style="font-size:11px; color:#94a3b8; font-weight:600;">🔊 Vol:</span>
             <input type="range" id="volSliderB" min="10" max="100" step="5" value="100" style="flex:1; accent-color:#3b82f6; cursor:pointer;" onchange="changeVolume('Receiver_B', this.value)" oninput="document.getElementById('volValB').textContent = this.value + '%'">
@@ -1379,16 +1441,19 @@ app.get('/dashboard', (req, res) => {
         <!-- Transmitter -->
         <div class="device-item" id="cardTransmitter">
           <div class="device-header">
-            <span class="device-name">Transmitter Pager</span>
+            <span class="device-name">Tombol Bel Luar</span>
             <span class="badge-status badge-online">ESP-NOW</span>
           </div>
-          <div id="infoTransmitter" class="device-meta">Deep Sleep (~5µA) • LED off</div>
-          <div id="batteryTransmitter" class="device-meta" style="margin-top:3px; color:#10b981; font-weight:600;">🔋 Baterai: Standby (~5µA)</div>
+          <div id="infoTransmitter" class="device-meta">Deep Sleep (~5µA) • Standby</div>
+          <div id="batteryTransmitter" class="device-meta" style="margin-top:2px; color:#10b981; font-weight:600;">🔋 Baterai: Standby (~5µA)</div>
+          <div class="battery-meter-container">
+            <div class="battery-meter-fill" id="batMeterFill"></div>
+          </div>
         </div>
       </div>
     </section>
 
-    <!-- Quick Actions Bento -->
+    <!-- Bento 2-Col Actions -->
     <div class="action-grid">
       <!-- Remote Trigger -->
       <section class="card" style="display:flex; flex-direction:column; justify-content:space-between;">
@@ -1419,7 +1484,7 @@ app.get('/dashboard', (req, res) => {
 
         <!-- Buzzer Type Segmented Control -->
         <div style="border-top: 1px solid #1e293b; padding-top: 10px;">
-          <div style="font-size:11px; font-weight:600; color:#94a3b8; margin-bottom:6px;">Tipe Modul Buzzer:</div>
+          <div style="font-size:11px; font-weight:600; color:#94a3b8; margin-bottom:6px;">Tipe Modul Buzzer Hardware:</div>
           <div class="segmented-control">
             <button class="segmented-btn active" id="btnTypePassive" onclick="setBuzzerType('passive')">Passive (3-Pin PWM)</button>
             <button class="segmented-btn" id="btnTypeActive" onclick="setBuzzerType('active')">Active (2-Pin Beep)</button>
@@ -1443,14 +1508,14 @@ app.get('/dashboard', (req, res) => {
           <span style="font-size:10px; font-weight:700; color:#10b981; text-transform:uppercase; letter-spacing:0.4px;">Lagu Terpasang Saat Ini</span>
           <div id="activeMelodyTitle" style="font-size:14px; font-weight:700; color:#f8fafc; margin-top:2px;">Super Mario Bros</div>
         </div>
-        <button class="btn-sm btn-preview" onclick="previewCurrentActiveMelody()">
+        <button class="btn-sm btn-preview" id="btnPreviewActive" onclick="previewCurrentActiveMelody()">
           <span>▶</span> Dengar
         </button>
       </div>
 
       <!-- Filters & Search -->
       <div class="filter-bar">
-        <input type="text" class="search-input" id="searchMelodyInput" placeholder="Cari lagu (Mario, Tetris, Star Wars, Rickroll)..." oninput="filterMelodies()">
+        <input type="text" class="search-input" id="searchMelodyInput" placeholder="Cari lagu (Mario, Tetris, Star Wars, Nokia, Rickroll)..." oninput="filterMelodies()">
         <div style="display:flex; gap:6px; flex-wrap:wrap;">
           <button class="cat-pill active" id="catAll" onclick="filterCategory('all')">Semua (52)</button>
           <button class="cat-pill" id="catGames" onclick="filterCategory('games')">Games</button>
@@ -1468,10 +1533,10 @@ app.get('/dashboard', (req, res) => {
     <section class="card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
         <div>
-          <h2 class="card-title">Proteksi Anti-Spam</h2>
+          <h2 class="card-title">Proteksi Anti-Spam (Tamu Iseng)</h2>
           <p class="card-subtitle" style="margin-bottom:0;">Atur ambang jeda dan durasi istirahat buzzer tanpa restart server</p>
         </div>
-        <button class="btn-sm btn-apply" onclick="saveSpamSettings()">Simpan</button>
+        <button class="btn-sm btn-apply" onclick="saveSpamSettings()">Simpan Aturan</button>
       </div>
 
       <div class="spam-grid">
@@ -1509,7 +1574,10 @@ app.get('/dashboard', (req, res) => {
 
     <!-- Activity Log -->
     <section class="card">
-      <h2 class="card-title" style="margin-bottom:12px;">Riwayat Bel</h2>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <h2 class="card-title" style="margin-bottom:0;">Riwayat Bel</h2>
+        <button class="btn-clear-history" onclick="confirmClearHistory()">Bersihkan Riwayat</button>
+      </div>
       <div style="overflow-x:auto;">
         <table class="log-table">
           <thead>
@@ -1533,7 +1601,6 @@ app.get('/dashboard', (req, res) => {
   </main>
 
   <script>
-    // Storage Fallback (sessionStorage + localStorage + URL param)
     function getStoredApiKey() {
       try {
         const urlParams = new URLSearchParams(window.location.search);
@@ -1562,9 +1629,17 @@ app.get('/dashboard', (req, res) => {
       } catch(_) {}
     }
 
-    let lastKnownCount = 0;
+    // Live Clock
+    setInterval(() => {
+      const el = document.getElementById('liveClock');
+      if (el) {
+        const now = new Date();
+        el.textContent = now.toLocaleTimeString('id-ID', { timeZone: 'Asia/Jakarta' }) + ' WIB';
+      }
+    }, 1000);
+
     let allMelodies = [];
-    let notesCache = {}; // Cache nada lagu yang sudah di-fetch agar preview instan
+    let notesCache = {};
     let currentActiveMelodyId = 'mario_bros';
     let currentActiveMelodyMode = 'short';
     let localMelodyModes = {};
@@ -1572,7 +1647,8 @@ app.get('/dashboard', (req, res) => {
     let selectedCategory = 'all';
     let audioCtx = null;
     let activeAudioTimers = [];
-    let lastSettingChangeTime = 0; // Kunci anti-race-condition agar polling tidak membalikkan pilihan user
+    let currentPlayingId = null;
+    let lastSettingChangeTime = 0;
 
     function logout() {
       try {
@@ -1582,7 +1658,6 @@ app.get('/dashboard', (req, res) => {
       window.location.href = '/';
     }
 
-    /* Notifikasi Toast */
     function showToast(msg, isSuccess = true) {
       let toast = document.getElementById('toastNotice');
       if (!toast) {
@@ -1611,7 +1686,7 @@ app.get('/dashboard', (req, res) => {
         const res = await fetch('/ring', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
-          body: JSON.stringify({ source: 'Web' })
+          body: JSON.stringify({ source: 'Web Dashboard' })
         });
         if (res.ok) {
           showToast('🔔 Bel pintu berhasil dibunyikan!');
@@ -1687,7 +1762,7 @@ app.get('/dashboard', (req, res) => {
       }
     }
 
-    /* Audio Preview Web Audio API */
+    /* Audio Preview Web Audio API (No Overlap) */
     function stopAudio() {
       activeAudioTimers.forEach(t => clearTimeout(t));
       activeAudioTimers = [];
@@ -1695,10 +1770,36 @@ app.get('/dashboard', (req, res) => {
         try { audioCtx.close(); } catch(e){}
         audioCtx = null;
       }
+      currentPlayingId = null;
+      updatePlayButtonStates();
     }
 
-    function playMelodyPreview(notes) {
+    function updatePlayButtonStates() {
+      document.querySelectorAll('.btn-preview').forEach(btn => {
+        btn.classList.remove('playing');
+        btn.innerHTML = '<span>▶</span> Dengar';
+      });
+      if (currentPlayingId) {
+        const activeBtn = document.querySelector('.song-card[data-id="' + currentPlayingId + '"] .btn-preview');
+        if (activeBtn) {
+          activeBtn.classList.add('playing');
+          activeBtn.innerHTML = '<span>⏹</span> Berhenti';
+        }
+        if (currentPlayingId === currentActiveMelodyId) {
+          const actEl = document.getElementById('btnPreviewActive');
+          if (actEl) {
+            actEl.classList.add('playing');
+            actEl.innerHTML = '<span>⏹</span> Berhenti';
+          }
+        }
+      }
+    }
+
+    function playMelodyPreview(notes, songId) {
       stopAudio();
+      currentPlayingId = songId;
+      updatePlayButtonStates();
+
       try {
         audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === 'suspended') audioCtx.resume();
@@ -1747,13 +1848,20 @@ app.get('/dashboard', (req, res) => {
 
     async function playMelodyById(id, mode = null, ev = null) {
       if (ev) ev.stopPropagation();
+
+      // Toggle off jika sedang memainkan lagu yang sama
+      if (currentPlayingId === id) {
+        stopAudio();
+        return;
+      }
+
       const chosenMode = mode || localMelodyModes[id] || (allMelodies.find(x => x.id === id)?.totalNotes <= 36 ? 'full' : 'short');
       const cacheKey = id + '_' + chosenMode;
       const m = allMelodies.find(x => x.id === id);
-      showToast('▶ Memuat suara: ' + (m ? m.name : id) + ' [' + (chosenMode === 'full' ? 'Penuh' : 'Ringkas') + ']');
+      showToast('▶ Memutar suara: ' + (m ? m.name : id) + ' [' + (chosenMode === 'full' ? 'Penuh' : 'Ringkas') + ']');
 
       if (notesCache[cacheKey]) {
-        playMelodyPreview(notesCache[cacheKey]);
+        playMelodyPreview(notesCache[cacheKey], id);
         return;
       }
 
@@ -1765,7 +1873,7 @@ app.get('/dashboard', (req, res) => {
           const data = await res.json();
           if (data.notes) {
             notesCache[cacheKey] = data.notes;
-            playMelodyPreview(data.notes);
+            playMelodyPreview(data.notes, id);
           }
         } else {
           showToast('❌ Gagal memuat audio lagu', false);
@@ -1883,13 +1991,15 @@ app.get('/dashboard', (req, res) => {
         let warningHtml = '';
         if (isExtreme) {
           warningHtml = '<div class="song-warning-box extreme">' +
-            '🚨 <b>Peringatan Ekstrem:</b> Lagu berbunyi <b>~' + Math.round(m.fullDurationSec/60*10)/10 + ' menit (' + m.totalNotes + ' nada)</b> non-stop! Bel rumah akan berbunyi sangat lama.' +
+            '🚨 <b>Peringatan Ekstrem:</b> Lagu berbunyi <b>~' + Math.round(m.fullDurationSec/60*10)/10 + ' menit (' + m.totalNotes + ' nada)</b> non-stop!' +
           '</div>';
         } else if (isLong) {
           warningHtml = '<div class="song-warning-box">' +
-            '⚠️ <b>Peringatan:</b> Berbunyi <b>~' + m.fullDurationSec + ' detik</b> non-stop. Selama berbunyi bel tidak bisa dipencet ulang.' +
+            '⚠️ <b>Peringatan:</b> Berbunyi <b>~' + m.fullDurationSec + ' detik</b> non-stop.' +
           '</div>';
         }
+
+        const isPlayingThis = (currentPlayingId === m.id);
 
         return '<div class="song-card ' + (isActive ? 'active-song' : '') + '" data-id="' + m.id + '">' +
           '<div>' +
@@ -1903,7 +2013,9 @@ app.get('/dashboard', (req, res) => {
             warningHtml +
           '</div>' +
           '<div class="song-actions" style="margin-top:8px;">' +
-            '<button type="button" class="btn-sm btn-preview" onclick="previewCard(this, event)">▶ Dengar</button>' +
+            '<button type="button" class="btn-sm btn-preview ' + (isPlayingThis ? 'playing' : '') + '" onclick="previewCard(this, event)">' +
+              (isPlayingThis ? '<span>⏹</span> Berhenti' : '<span>▶</span> Dengar') +
+            '</button>' +
             '<button type="button" class="btn-sm btn-apply" onclick="applyCard(this, event)">' + (isActive ? 'Simpan Pilihan' : 'Pasang') + '</button>' +
           '</div>' +
         '</div>';
@@ -1930,7 +2042,7 @@ app.get('/dashboard', (req, res) => {
 
     async function applyMelody(melodyId, mode = null, ev = null) {
       if (ev) ev.stopPropagation();
-      lastSettingChangeTime = Date.now(); // Kunci polling 5 detik
+      lastSettingChangeTime = Date.now();
       const m = allMelodies.find(x => x.id === melodyId);
       const chosenMode = mode || localMelodyModes[melodyId] || (m && m.totalNotes <= 36 ? 'full' : 'short');
       localMelodyModes[melodyId] = chosenMode;
@@ -1941,11 +2053,7 @@ app.get('/dashboard', (req, res) => {
       renderMelodyCards();
 
       const durText = m ? (chosenMode === 'full' ? m.fullDurationSec + 's (Penuh)' : m.shortDurationSec + 's (Ringkas)') : '';
-      if (chosenMode === 'full' && m && m.fullDurationSec >= 15) {
-        showToast('⚠️ Pasang Lagu Penuh: ' + (m ? m.name : melodyId) + ' (~' + durText + '). Perhatian: durasi panjang!');
-      } else {
-        showToast('⏳ Menyimpan lagu: ' + (m ? m.name : melodyId) + ' (' + durText + ')...');
-      }
+      showToast('⏳ Menyimpan lagu: ' + (m ? m.name : melodyId) + ' (' + durText + ')...');
 
       try {
         const res = await fetch('/api/settings', {
@@ -1964,10 +2072,9 @@ app.get('/dashboard', (req, res) => {
     }
 
     async function setBuzzerType(type) {
-      lastSettingChangeTime = Date.now(); // Kunci polling 5 detik
+      lastSettingChangeTime = Date.now();
       currentBuzzerType = type;
       updateBuzzerTypeUI(type);
-      showToast(type === 'passive' ? '🔊 Mode: Passive Buzzer (3-Pin PWM)' : '🔉 Mode: Active Buzzer (2-Pin Beep)');
 
       try {
         const res = await fetch('/api/settings', {
@@ -1976,7 +2083,7 @@ app.get('/dashboard', (req, res) => {
           body: JSON.stringify({ buzzer_type: type })
         });
         if (res.ok) {
-          showToast(type === 'passive' ? '✅ Buzzer Passive 3-Pin Tersimpan' : '✅ Buzzer Active 2-Pin Tersimpan');
+          showToast(type === 'passive' ? '✅ Buzzer Passive 3-Pin PWM Tersimpan' : '✅ Buzzer Active 2-Pin Beep Tersimpan');
         } else {
           showToast('❌ Gagal update tipe buzzer (' + res.status + ')', false);
         }
@@ -2049,7 +2156,6 @@ app.get('/dashboard', (req, res) => {
       updateDevice('cardReceiverA', 'badgeReceiverA', 'infoReceiverA', 'ringReceiverA', receivers ? receivers['Receiver_A'] : null, 'Rumah A');
       updateDevice('cardReceiverB', 'badgeReceiverB', 'infoReceiverB', 'ringReceiverB', receivers ? receivers['Receiver_B'] : null, 'Rumah B');
 
-      // Update Slider Volume
       if (volumes) {
         const sliderA = document.getElementById('volSliderA');
         const valA = document.getElementById('volValA');
@@ -2067,20 +2173,30 @@ app.get('/dashboard', (req, res) => {
 
       const infoTx = document.getElementById('infoTransmitter');
       const batTx = document.getElementById('batteryTransmitter');
+      const batMeter = document.getElementById('batMeterFill');
+
       if (infoTx) {
         infoTx.textContent = (lastClickSerial !== null && lastClickSerial !== undefined)
-          ? 'Deep Sleep siaga • Seri #' + lastClickSerial + ' (ESP-NOW 2.4GHz)'
-          : 'Deep Sleep siaga (~5µA) • LED off';
+          ? 'Deep Sleep siaga (~5µA) • Seri #' + lastClickSerial + ' (ESP-NOW)'
+          : 'Deep Sleep siaga (~5µA) • Siap siaga';
       }
       if (batTx) {
-        if (battery && battery.pct !== null && battery.pct !== undefined) {
-          const pct = battery.pct;
+        if (battery && battery.mv) {
+          const pct = battery.pct !== null ? battery.pct : 0;
           const volt = battery.voltage || (battery.mv / 1000).toFixed(2);
           const col = pct > 50 ? '#10b981' : (pct > 20 ? '#f59e0b' : '#ef4444');
           const icon = pct > 50 ? '🔋' : (pct > 20 ? '🪫' : '⚠️');
-          batTx.innerHTML = '<span style="color:' + col + '; font-weight:700;">' + icon + ' ' + pct + '% (' + volt + 'V) • 18650</span>';
+          batTx.innerHTML = '<span style="color:' + col + '; font-weight:700;">' + icon + ' ' + (battery.pct !== null ? pct + '% ' : '') + '(' + volt + 'V) • 18650</span>';
+          if (batMeter) {
+            batMeter.style.width = (battery.pct !== null ? pct : 50) + '%';
+            batMeter.style.background = col;
+          }
         } else {
-          batTx.innerHTML = '<span style="color:#64748b;">🔋 Baterai: Standby (Pasang 2x R 100kΩ untuk monitor %)</span>';
+          batTx.innerHTML = '<span style="color:#64748b;">🔋 Baterai: Standby (~5µA)</span>';
+          if (batMeter) {
+            batMeter.style.width = '100%';
+            batMeter.style.background = '#334155';
+          }
         }
       }
     }
@@ -2099,6 +2215,20 @@ app.get('/dashboard', (req, res) => {
       } catch(_) {}
     }
 
+    async function confirmClearHistory() {
+      if (!confirm('Yakin ingin membersihkan semua riwayat dering bel?')) return;
+      try {
+        const res = await fetch('/api/clear_history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY }
+        });
+        if (res.ok) {
+          showToast('✅ Riwayat berhasil dibersihkan');
+          fetchHistory();
+        }
+      } catch(_) {}
+    }
+
     async function fetchHistory() {
       try {
         const res = await fetch('/api/history', { headers: { 'x-api-key': API_KEY } });
@@ -2109,7 +2239,6 @@ app.get('/dashboard', (req, res) => {
 
         updateMuteUI(data.muted);
 
-        // Hanya sinkronkan lagu dan buzzer type jika user TIDAK sedang mengeklik dalam 5 detik terakhir
         if (Date.now() - lastSettingChangeTime > 5000) {
           if (data.active_melody && (currentActiveMelodyId !== data.active_melody || (data.active_mode && currentActiveMelodyMode !== data.active_mode))) {
             currentActiveMelodyId = data.active_melody;
@@ -2152,7 +2281,10 @@ app.get('/dashboard', (req, res) => {
             statusText.textContent = data.muted ? 'RINGING (MUTE)' : 'RINGING';
             statusText.style.color = '#f59e0b';
           }
-          if (alertBox) alertBox.style.display = 'block';
+          if (alertBox) {
+            alertBox.style.display = 'block';
+            alertBox.textContent = '🔔 BEL PINTU SEDANG BERBUNYI! [' + (data.melody_name || 'Melodi') + ']';
+          }
         } else {
           if (dot) dot.classList.remove('ringing');
           if (statusText) {
@@ -2183,12 +2315,11 @@ app.get('/dashboard', (req, res) => {
 
             const isWeb = (entry.source && entry.source.includes('Web'));
             const srcClass = isWeb ? 'badge-src-web' : 'badge-src-btn';
-            const srcLabel = isWeb ? 'Web Hub' : 'Tombol Pager';
+            const srcLabel = isWeb ? 'Web Hub' : 'Tombol Bel';
 
             const statusColor = (entry.allowed !== false) ? '#10b981' : '#ef4444';
             const statusText = (entry.allowed !== false) ? 'Dering #' + (entry.consecutive || 1) : (entry.status_text || 'Hold');
 
-            // Render pill receiver yang berhasil bunyi
             let rPills = '';
             if (entry.receivers_ack && entry.receivers_ack.length > 0) {
               rPills = entry.receivers_ack.map(function(r) {
@@ -2222,7 +2353,6 @@ app.get('/dashboard', (req, res) => {
       }
     }
 
-    // Polling Loop Sekuensial (Bebas bottleneck antrean request)
     let isPolling = false;
     async function pollLoop() {
       if (!isPolling) {
@@ -2240,10 +2370,8 @@ app.get('/dashboard', (req, res) => {
     pollLoop();
   </script>
 </body>
-</html>
-  `);
+</html>`);
 });
-
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Doorbell Server berjalan di port ${PORT}`);
